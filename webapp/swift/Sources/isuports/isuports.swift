@@ -1,8 +1,7 @@
-@preconcurrency import MySQLKit
-@preconcurrency import SQLiteKit
-@preconcurrency import SQLKit
+import MySQLKit
+import SQLiteKit
 import JWTKit
-@preconcurrency import TSCBasic
+import TSCBasic
 import Vapor
 
 let tenantDBSchemaFilePath = "../sql/tenant/10_schema.sql"
@@ -163,14 +162,15 @@ struct Handler {
     }
     
     // テナントDBのパスを返す
-    nonisolated func tenantDBPath(id: Int) -> RelativePath {
+    func tenantDBPath(id: Int64) -> AbsolutePath {
         let tenantDBDir = getEnv(key: "ISUCON_TENANT_DB_DIR", defaultValue: "../tenant_db")
-        return RelativePath(tenantDBDir)
+        let pwd = AbsolutePath(FileManager.default.currentDirectoryPath)
+        return .init(tenantDBDir, relativeTo: pwd)
             .appending(component: "\(id).db")
     }
     
     // テナントDBに接続する
-    func connectToTenantDB(id: Int) async throws -> SQLiteConnection {
+    func connectToTenantDB(id: Int64) async throws -> SQLiteConnection {
         try await SQLiteConnection.open(
             storage: .file(path: tenantDBPath(id: id).pathString),
             threadPool: threadPool,
@@ -179,7 +179,7 @@ struct Handler {
     }
     
     // テナントDBを新規に作成する
-    func createTenantDB(id: Int) async throws {
+    func createTenantDB(id: Int64) async throws {
         let path = tenantDBPath(id: id)
         try await threadPool.task {
             let result = try Process.popen(args: "sh", "-c", "sqlite3 \(path) < \(tenantDBSchemaFilePath)")
@@ -367,19 +367,18 @@ struct Handler {
     }
     
     // 排他ロックのためのファイル名を生成する
-    func lockFilePath(id: Int64) -> RelativePath {
+    func lockFilePath(id: Int64) -> AbsolutePath {
         let tenantDBDir = getEnv(key: "ISUCON_TENANT_DB_DIR", defaultValue: "../tenant_db")
-        return RelativePath(tenantDBDir)
+        let pwd = AbsolutePath(FileManager.default.currentDirectoryPath)
+        return .init(tenantDBDir, relativeTo: pwd)
             .appending(component: "\(id).lock")
     }
     
     // 排他ロックする
     func flockByTenantID<T>(tenantID: Int64, _ body: () throws -> T) throws -> T {
         let p = lockFilePath(id: tenantID)
-        guard let pwd = localFileSystem.currentWorkingDirectory else {
-            throw StringError("error localFileSystem.currentWorkingDirectory")
-        }
-        let fl = FileLock(at: AbsolutePath(pwd, p))
+        
+        let fl = FileLock(at: p)
         return try fl.withLock(type: .exclusive, body)
     }
     
@@ -654,7 +653,7 @@ extension SQLDatabase {
     }
 }
 
-final class SQLExecuteBuilder: SQLQueryFetcher, Sendable {
+final class SQLExecuteBuilder: SQLQueryFetcher {
     let query: any SQLExpression
     let database: any SQLDatabase
 
@@ -671,3 +670,6 @@ extension Response {
         return response
     }
 }
+
+extension AbsolutePath: @unchecked Sendable {}
+extension RelativePath: @unchecked Sendable {}
