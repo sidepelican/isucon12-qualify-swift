@@ -13,11 +13,13 @@ let package = Package(
         .package(url: "https://github.com/vapor/vapor.git", from: "4.64.0"),
         .package(url: "https://github.com/vapor/mysql-kit.git", from: "4.5.2"),
         .package(url: "https://github.com/vapor/sqlite-kit.git", from: "4.1.0"),
+        .package(url: "https://github.com/vapor/jwt-kit.git", from: "4.7.0"),
     ],
     targets: [
         .executableTarget(
             name: "isuports",
             dependencies: [
+                .product(name: "JWTKit", package: "jwt-kit"),
                 .product(name: "MySQLKit", package: "mysql-kit"),
                 .product(name: "SQLiteKit", package: "sqlite-kit"),
                 .product(name: "TSCBasic", package: "swift-tools-support-core"),
