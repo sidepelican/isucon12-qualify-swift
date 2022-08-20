@@ -2,7 +2,7 @@
 @preconcurrency import SQLiteKit
 @preconcurrency import SQLKit
 import JWTKit
-import TSCBasic
+@preconcurrency import TSCBasic
 import Vapor
 
 let tenantDBSchemaFilePath = "../sql/tenant/10_schema.sql"
@@ -22,7 +22,7 @@ func getEnv(key: String, defaultValue: String) -> String {
 }
 
 // 管理用DBに接続する
-func connectAdminDB() -> (EventLoopConnectionPool<MySQLConnectionSource>, shutdown: () throws -> Void) {
+func connectAdminDB() -> (EventLoopConnectionPool<MySQLConnectionSource>, some Closable) {
     let configuration = MySQLConfiguration(
         hostname: getEnv(key: "ISUCON_DB_HOST", defaultValue: "127.0.0.1"),
         port: Int(getEnv(key: "ISUCON_DB_PORT", defaultValue: "3306"))!,
@@ -43,18 +43,16 @@ func connectAdminDB() -> (EventLoopConnectionPool<MySQLConnectionSource>, shutdo
         on: eventLoopGroup.next()
     )
     
-    return (pool, shutdown: {
-        try pool.close().wait()
-        try eventLoopGroup.syncShutdownGracefully()
-    })
-}
-
-// テナントDBのパスを返す
-func tenantDBPath(id: Int) -> String {
-    let tenantDBDir = getEnv(key: "ISUCON_TENANT_DB_DIR", defaultValue: "../tenant_db")
-    return RelativePath(tenantDBDir)
-        .appending(component: "\(id).db")
-        .pathString
+    struct Context: Closable {
+        var pool: EventLoopConnectionPool<MySQLConnectionSource>
+        var eventLoopGroup: MultiThreadedEventLoopGroup
+        func close() throws {
+            try pool.close().wait()
+            try eventLoopGroup.syncShutdownGracefully()
+        }
+    }
+    let context = Context(pool: pool, eventLoopGroup: eventLoopGroup)
+    return (context.pool, context)
 }
 
 // 全APIにCache-Control: privateを設定する
@@ -68,15 +66,29 @@ final class CacheControlPrivateMiddleware: Middleware {
     }
 }
 
-struct Server {
+struct Handler {
+    var request: Request
     var adminDB: any MySQLDatabase
     var threadPool: NIOThreadPool
     var eventLoopGroup: any EventLoopGroup
+    init(request: Request, adminDB: any MySQLDatabase, threadPool: NIOThreadPool, eventLoopGroup: any EventLoopGroup) {
+        self.request = request
+        self.adminDB = adminDB
+        self.threadPool = threadPool
+        self.eventLoopGroup = eventLoopGroup
+    }
+    
+    // テナントDBのパスを返す
+    nonisolated func tenantDBPath(id: Int) -> RelativePath {
+        let tenantDBDir = getEnv(key: "ISUCON_TENANT_DB_DIR", defaultValue: "../tenant_db")
+        return RelativePath(tenantDBDir)
+            .appending(component: "\(id).db")
+    }
     
     // テナントDBに接続する
     func connectToTenantDB(id: Int) async throws -> SQLiteConnection {
         try await SQLiteConnection.open(
-            storage: .file(path: tenantDBPath(id: id)),
+            storage: .file(path: tenantDBPath(id: id).pathString),
             threadPool: threadPool,
             on: eventLoopGroup.next()
         ).get()
@@ -84,8 +96,8 @@ struct Server {
     
     // テナントDBを新規に作成する
     func createTenantDB(id: Int) async throws {
+        let path = tenantDBPath(id: id)
         try await threadPool.task {
-            let path = tenantDBPath(id: id)
             let result = try Process.popen(args: "sh", "-c", "sqlite3 \(path) < \(tenantDBSchemaFilePath)")
             guard result.exitStatus == .terminated(code: 0) else {
                 throw StringError("failed to exec sqlite3 \(path) < \(tenantDBSchemaFilePath), out=\(try result.utf8Output()), err=\(try result.utf8stderrOutput())")
@@ -94,12 +106,12 @@ struct Server {
     }
     
     // システム全体で一意なIDを生成する
-    func dispenseID(req: Request) async throws -> String {
+    func dispenseID() async throws -> String {
         var lastError: Error?
         for _ in 0..<100 {
             var lastInsertID: UInt64?
             do {
-                try await adminDB.logging(to: req.logger)
+                try await adminDB
                     .query("REPLACE INTO id_generator (stub) VALUES (?);", ["a"], onRow: { _ in }, onMetadata: { metadata in
                         lastInsertID = metadata.lastInsertID
                     })
@@ -122,53 +134,6 @@ struct Server {
             }
         }
         throw lastError ?? StringError("unexpected")
-    }
-    
-    // run は main から呼ばれるエントリーポイントです
-    func run(port: Int) async throws {
-        let app = try Application(.detect(), .shared(eventLoopGroup))
-        defer { app.shutdown() }
-        
-        app.http.server.configuration.port = port
-        
-        app.middleware.use(CacheControlPrivateMiddleware())
-        
-        app.post("/api/admin/tenants/add", use: tenantsAdd)
-        
-//        app.get("hello") { req in
-//            return "Hello, world.\n"
-//        }
-//
-//        app.get("version") { (req) in
-//            let rows = try await adminDB.simpleQuery("SELECT version();").get()
-//            return "\(rows)\n"
-//        }
-//
-//        app.get("bind") { (req) async throws -> String in
-//            let sql: SQLDatabase = adminDB.sql()
-//
-//            struct Row: Decodable {
-//                var value: String
-//            }
-//            return try await sql.execute("SELECT \(bind: "binded value") as value;")
-//                .first(decoding: Row.self)?
-//                .value ?? "nil"
-//        }
-//
-//        app.get("sqlite") { (req) in
-//            try await createTenantDB(id: 1)
-//            let db = try await connectToTenantDB(id: 1)
-//            let row = try await db.sql().execute("SELECT sqlite_version();").first()!
-//            return "\(row)"
-//        }
-
-        do {
-            try app.start()
-            try await app.running?.onStop.get()
-        } catch {
-            app.logger.report(error: error)
-            throw error
-        }
     }
     
     struct SuccessResult<T: Encodable>: Encodable {
@@ -200,8 +165,8 @@ struct Server {
     }
     
     // リクエストヘッダをパースしてViewerを返す
-    func parseViewer(req: Request) async throws -> Viewer {
-        guard let cookie = req.cookies[cookieName] else {
+    func parseViewer() async throws -> Viewer {
+        guard let cookie = request.cookies[cookieName] else {
             throw Abort(.unauthorized, reason: "cookie \(cookieName) is not found")
         }
         let tokenString = cookie.string
@@ -231,7 +196,7 @@ struct Server {
         guard tokenAud.count == 1 else {
             throw Abort(.unauthorized, reason: "invalid token: aud field is few or too much: \(tokenString)")
         }
-        guard let tenant = try await retrieveTenantRowFromHeader(req: req) else {
+        guard let tenant = try await retrieveTenantRowFromHeader() else {
             throw Abort(.unauthorized, reason: "tenant not found")
         }
         if tenant.name == "admin" && role != .admin {
@@ -239,16 +204,16 @@ struct Server {
         }
 
         guard tenant.name == tokenAud[0] else {
-            throw Abort(.unauthorized, reason: "invalid token: tenant name is not match with \(req.url.host ?? ""): \(tokenString)")
+            throw Abort(.unauthorized, reason: "invalid token: tenant name is not match with \(request.url.host ?? ""): \(tokenString)")
         }
         
         return Viewer(role: role, playerID: tokenSub, tenantName: tenant.name, tenantID: tenant.id)
     }
     
-    func retrieveTenantRowFromHeader(req: Request) async throws -> TenantRow? {
+    func retrieveTenantRowFromHeader() async throws -> TenantRow? {
         // JWTに入っているテナント名とHostヘッダのテナント名が一致しているか確認
         let baseHost = getEnv(key: "ISUCON_BASE_HOSTNAME", defaultValue: ".t.isucon.dev")
-        let host = req.url.host ?? ""
+        let host = request.url.host ?? ""
         let tenantName = host.hasSuffix(baseHost)
             ? String(host[host.startIndex ..< host.index(host.endIndex, offsetBy: -baseHost.count)])
             : host
@@ -316,6 +281,34 @@ struct Server {
         ).first(decoding: CompetitionRow.self)
     }
     
+    struct PlayerScoreRow: Decodable {
+        var tenant_id: Int64
+        var id: String
+        var player_id: String
+        var competition_id: String
+        var score: Int64
+        var row_num: Int64
+        var created_at: Int64
+        var updated_at: Int64
+    }
+    
+    // 排他ロックのためのファイル名を生成する
+    func lockFilePath(id: Int64) -> RelativePath {
+        let tenantDBDir = getEnv(key: "ISUCON_TENANT_DB_DIR", defaultValue: "../tenant_db")
+        return RelativePath(tenantDBDir)
+            .appending(component: "\(id).lock")
+    }
+
+    // 排他ロックする
+    func flockByTenantID<T>(tenantID: Int64, _ body: () throws -> T) throws -> T {
+        let p = lockFilePath(id: tenantID)
+        guard let pwd = localFileSystem.currentWorkingDirectory else {
+            throw StringError("error localFileSystem.currentWorkingDirectory")
+        }
+        let fl = FileLock(at: AbsolutePath(pwd, p))
+        return try fl.withLock(type: .exclusive, body)
+    }
+    
     struct TenantsAddResult: Encodable {
         var tenant: TenantWithBilling
     }
@@ -323,8 +316,16 @@ struct Server {
     // SasS管理者用API
     // テナントを追加する
     // POST /api/admin/tenants/add
-    func tenantsAdd(req: Request) async throws -> TenantsAddResult {
+    func tenantsAdd() async throws -> TenantsAddResult {
         fatalError("TODO")
+    }
+    
+    // テナント名が規則に沿っているかチェックする
+    func validateTenantName(name: String) throws {
+        if !name.matches(of: tenantNameRegexp).isEmpty {
+            return
+        }
+        throw StringError("invalid tenant name: \(name)")
     }
     
     struct TenantWithBilling: Encodable  {
@@ -344,22 +345,38 @@ struct Server {
         }
         
         let (pool, shutdown) = connectAdminDB()
-        defer { try! shutdown() }
+        defer { try! shutdown.close() }
         
         let threadPool = NIOThreadPool(numberOfThreads: 16)
         threadPool.start()
         defer { try! threadPool.syncShutdownGracefully() }
         
-        let eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
-        defer { try! eventLoopGroup.syncShutdownGracefully() }
+        let app = try Application(.detect())
+        defer { app.shutdown() }
         
-        let server = Server(
-            adminDB: pool.database(logger: .init(label: "adminDB")),
-            threadPool: threadPool,
-            eventLoopGroup: eventLoopGroup
-        )
+        app.http.server.configuration.port = Int(getEnv(key: "SERVER_APP_PORT", defaultValue: "3000"))!
+        app.middleware.use(CacheControlPrivateMiddleware())
         
-        try await server.run(port: Int(getEnv(key: "SERVER_APP_PORT", defaultValue: "3000"))!)
+        func jsonRoute(_ route: @escaping @Sendable (Handler.Type) -> ((Handler) -> () async throws -> some Encodable)) -> (Request) async throws -> Response {
+            { request in
+                let server = Handler(
+                    request: request,
+                    adminDB: pool.database(logger: request.logger),
+                    threadPool: threadPool,
+                    eventLoopGroup: request.eventLoop
+                )
+                let handler = route(Handler.self)
+                let result = try await handler(server)()
+                let response = Response()
+                try response.content.encode(result, as: .json)
+                return response
+            }
+        }
+        
+        app.post("/api/admin/tenants/add", use: jsonRoute { $0.tenantsAdd })
+        
+        try app.start()
+        try await app.running?.onStop.get()
     }
 }
 
