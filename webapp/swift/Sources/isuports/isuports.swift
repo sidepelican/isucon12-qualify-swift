@@ -198,6 +198,28 @@ struct Handler {
         ).get()
     }
     
+    // テナントDBに接続する
+    func connectToTenantDB<T>(id: Int64, _ closure: @escaping (SQLiteConnection) async throws -> T) async throws -> T {
+        let closure = UncheckedBox(value: closure)
+        return try await SQLiteConnection.open(
+            storage: .file(path: tenantDBPath(id: id).pathString),
+            threadPool: threadPool,
+            on: eventLoopGroup.next()
+        )
+        .flatMapWithEventLoop { (conn: SQLiteConnection, eventLoop: EventLoop) in
+            eventLoop.performWithTask {
+                try await closure.value(conn)
+            }
+            .flatMapAlways { (result) in
+                conn.close()
+                    .flatMapThrowing { () in
+                        try result.get()
+                    }
+            }
+        }
+        .get()
+    }
+    
     // テナントDBを新規に作成する
     func createTenantDB(id: Int64) async throws {
         let path = tenantDBPath(id: id)
@@ -435,11 +457,11 @@ struct Handler {
 
         var lastInsertID: UInt64?
         do {
-            let now = Date()
+            let now = Int64(Date().timeIntervalSince1970)
             try await adminDB
                 .query(
                     "INSERT INTO tenant (name, display_name, created_at, updated_at) VALUES (?, ?, ?, ?)",
-                    [.init(string: form.name), .init(string: form.display_name), .init(date: now),  .init(date: now)],
+                    [.init(string: form.name), .init(string: form.display_name), .init(int: Int(now)),  .init(int: Int(now))],
                     onRow: { _ in },
                     onMetadata: { metadata in
                         lastInsertID = metadata.lastInsertID
@@ -581,7 +603,67 @@ struct Handler {
     // GET /api/admin/tenants/billing
     // URL引数beforeを指定した場合、指定した値よりもidが小さいテナントの課金レポートを取得する
     func tenantsBilling() async throws -> Response {
-        return try .json(content: SuccessResult(data: "TODO"))
+        guard let host = request.url.host,
+              host == getEnv(key: "ISUCON_ADMIN_HOSTNAME", defaultValue: "admin.t.isucon.dev") else {
+            throw Abort(.notFound, reason: "invalid hostname \(request.url.host ?? "")")
+        }
+        
+        let v = try await parseViewer()
+        guard v.role == .admin else {
+            throw Abort(.forbidden, reason: "admin role required")
+        }
+        
+        struct Query: Decodable {
+            var before: Int64?
+        }
+        let query = try request.query.decode(Query.self)
+        let beforeID = query.before ?? 0
+
+        // テナントごとに
+        //   大会ごとに
+        //     scoreが登録されているplayer * 100
+        //     scoreが登録されていないplayerでアクセスした人 * 10
+        //   を合計したものを
+        // テナントの課金とする
+        let ts = try await adminDB.sql().execute(
+            "SELECT * FROM tenant ORDER BY id DESC"
+        ).all(decoding: TenantRow.self)
+        
+        var tenantBillings: [TenantWithBilling] = []
+        tenantBillings.reserveCapacity(ts.count)
+        
+        for t in ts {
+            if beforeID != 0 && beforeID <= t.id {
+                continue
+            }
+            
+            let tb = try await connectToTenantDB(id: t.id) { tenantDB in
+                var tb = TenantWithBilling(
+                    id: String(t.id),
+                    name: t.name,
+                    display_name: t.display_name,
+                    billing: 0
+                )
+                let cs = try await tenantDB.sql().execute(
+                    "SELECT * FROM competition WHERE tenant_id=\(bind: t.id)"
+                ).all(decoding: CompetitionRow.self)
+                for comp in cs {
+                    let report = try await billingReportByCompetition(tenantDB: tenantDB.sql(), tenantID: t.id, competitonID: comp.id)
+                    tb.billing += report.billing_yen
+                }
+                return tb
+            }
+            tenantBillings.append(tb)
+            
+            if tenantBillings.count >= 10 {
+                break
+            }
+        }
+        
+        let res = TenantsBillingResult(
+            tenants: tenantBillings
+        )
+        return try .json(content: SuccessResult(data: res))
     }
     
     struct PlayerDetail: Encodable {
@@ -598,18 +680,69 @@ struct Handler {
     // GET /api/organizer/players
     // 参加者一覧を返す
     func playersList() async throws -> Response {
-        return try .json(content: SuccessResult(data: "TODO"))
+        let v = try await parseViewer()
+        guard v.role == .organizer else {
+            throw Abort(.forbidden, reason: "role organizer required")
+        }
+        
+        return try await connectToTenantDB(id: v.tenantID) { tenantDB in
+            let pls = try await tenantDB.sql().execute(
+                "SELECT * FROM player WHERE tenant_id=\(bind: v.tenantID) ORDER BY created_at DESC"
+            ).all(decoding: PlayerRow.self)
+    
+            let res = PlayersListResult(
+                players: pls.map { p in
+                    PlayerDetail(id: p.id, display_name: p.display_name, is_disqualified: p.is_disqualified)
+                }
+            )
+            return try .json(content: SuccessResult(data: res))
+        }
     }
     
     struct PlayersAddResult: Encodable {
-        var players: PlayerDetail
+        var players: [PlayerDetail]
     }
     
     // テナント管理者向けAPI
     // GET /api/organizer/players/add
     // テナントに参加者を追加する
     func playersAdd() async throws -> Response {
-        return try .json(content: SuccessResult(data: "TODO"))
+        let v = try await parseViewer()
+        guard v.role == .organizer else {
+            throw Abort(.forbidden, reason: "role organizer required")
+        }
+        
+        return try await connectToTenantDB(id: v.tenantID) { tenantDB in
+            struct Form: Decodable {
+                var display_name: [String]
+            }
+            let form = try request.content.decode(Form.self)
+            let displayNames = form.display_name
+            
+            var pds: [PlayerDetail] = []
+            pds.reserveCapacity(displayNames.count)
+            
+            for displayName in displayNames {
+                let id = try await dispenseID()
+                
+                let now = Int64(Date().timeIntervalSince1970)
+                try await tenantDB.sql().execute(
+                    "INSERT INTO player (id, tenant_id, display_name, is_disqualified, created_at, updated_at) VALUES (\(bind: id), \(bind: v.tenantID), \(bind: displayName), \(bind: false), \(bind: now), \(bind: now))"
+                ).run()
+                
+                guard let p = try await retrievePlayer(tenantDB: tenantDB.sql(), id: id) else {
+                    throw StringError("error retrievePlayer")
+                }
+                pds.append(PlayerDetail(
+                    id: p.id,
+                    display_name: p.display_name,
+                    is_disqualified: p.is_disqualified
+                ))
+            }
+
+            let res = PlayersAddResult(players: pds)
+            return try .json(content: SuccessResult(data: res))
+        }
     }
     
     struct PlayerDisqualifiedResult: Encodable {
@@ -620,7 +753,35 @@ struct Handler {
     // POST /api/organizer/player/:player_id/disqualified
     // 参加者を失格にする
     func playerDisqualified() async throws -> Response {
-        return try .json(content: SuccessResult(data: "TODO"))
+        let v = try await parseViewer()
+        guard v.role == .organizer else {
+            throw Abort(.forbidden, reason: "role organizer required")
+        }
+        
+        return try await connectToTenantDB(id: v.tenantID) { tenantDB in
+            guard let playerID = request.parameters.get("player_id") else {
+                throw StringError("player_id not found")
+            }
+  
+            let now = Int64(Date().timeIntervalSince1970)
+            try await tenantDB.sql().execute(
+                "UPDATE player SET is_disqualified = \(bind: true), updated_at = \(bind: now) WHERE id = \(bind: playerID)"
+            ).run()
+            
+            guard let p = try await retrievePlayer(tenantDB: tenantDB.sql(), id: playerID) else {
+                // 存在しないプレイヤー
+                throw Abort(.notFound, reason: "player not found")
+            }
+            
+            let res = PlayerDisqualifiedResult(
+                player: PlayerDetail(
+                    id: p.id,
+                    display_name: p.display_name,
+                    is_disqualified: p.is_disqualified
+                )
+            )
+            return try .json(content: SuccessResult(data: res))
+        }
     }
     
     struct CompetitionDetail: Encodable {
@@ -637,6 +798,12 @@ struct Handler {
     // POST /api/organizer/competitions/add
     // 大会を追加する
     func competitionsAdd() async throws -> Response {
+        let v = try await parseViewer()
+        guard v.role == .organizer else {
+            throw Abort(.forbidden, reason: "role organizer required")
+        }
+        
+        
         return try .json(content: SuccessResult(data: "TODO"))
     }
     
@@ -644,6 +811,11 @@ struct Handler {
     // POST /api/organizer/competition/:competition_id/finish
     // 大会を終了する
     func competitionFinish() async throws -> Response {
+        let v = try await parseViewer()
+        guard v.role == .organizer else {
+            throw Abort(.forbidden, reason: "role organizer required")
+        }
+         
         return try .json(content: SuccessResult(data: "TODO"))
     }
     
@@ -655,6 +827,11 @@ struct Handler {
     // POST /api/organizer/competition/:competition_id/score
     // 大会のスコアをCSVでアップロードする
     func competitionScore() async throws -> Response {
+        let v = try await parseViewer()
+        guard v.role == .organizer else {
+            throw Abort(.forbidden, reason: "role organizer required")
+        }
+        
         return try .json(content: SuccessResult(data: "TODO"))
     }
     
@@ -666,6 +843,11 @@ struct Handler {
     // GET /api/organizer/billing
     // テナント内の課金レポートを取得する
     func billing() async throws -> Response {
+        let v = try await parseViewer()
+        guard v.role == .organizer else {
+            throw Abort(.forbidden, reason: "role organizer required")
+        }
+        
         return try .json(content: SuccessResult(data: "TODO"))
     }
     
@@ -683,6 +865,11 @@ struct Handler {
     // GET /api/player/player/:player_id
     // 参加者の詳細情報を取得する
     func player() async throws -> Response {
+        let v = try await parseViewer()
+        guard v.role == .player else {
+            throw Abort(.forbidden, reason: "role player required")
+        }
+        
         return try .json(content: SuccessResult(data: "TODO"))
     }
     
@@ -710,6 +897,11 @@ struct Handler {
     // GET /api/player/competition/:competition_id/ranking
     // 大会ごとのランキングを取得する
     func competitionRanking() async throws -> Response {
+        let v = try await parseViewer()
+        guard v.role == .player else {
+            throw Abort(.forbidden, reason: "role player required")
+        }
+        
         return try .json(content: SuccessResult(data: "TODO"))
     }
 
@@ -721,6 +913,11 @@ struct Handler {
     // GET /api/player/competitions
     // 大会の一覧を取得する
     func playerCompetitions() async throws -> Response {
+        let v = try await parseViewer()
+        guard v.role == .player else {
+            throw Abort(.forbidden, reason: "role player required")
+        }
+        
         return try .json(content: SuccessResult(data: "TODO"))
     }
     
@@ -728,6 +925,11 @@ struct Handler {
     // GET /api/organizer/competitions
     // 大会の一覧を取得する
     func organizerCompetitions() async throws -> Response {
+        let v = try await parseViewer()
+        guard v.role == .organizer else {
+            throw Abort(.forbidden, reason: "role organizer required")
+        }
+        
         return try .json(content: SuccessResult(data: "TODO"))
     }
     
@@ -743,7 +945,7 @@ struct Handler {
     struct MeResult: Encodable {
         var tenant: TenantDetail?
         var me: PlayerDetail?
-        var role: Role
+        var role: String
         var logged_in: Bool
     }
     
@@ -751,7 +953,59 @@ struct Handler {
     // GET /api/me
     // JWTで認証した結果、テナントやユーザ情報を返す
     func me() async throws -> Response {
-        return try .json(content: SuccessResult(data: "TODO"))
+        guard let tenant = try await retrieveTenantRowFromHeader() else {
+            throw StringError("error retrieveTenantRowFromHeader")
+        }
+        
+        let td = TenantDetail(
+            name: tenant.name,
+            display_name: tenant.display_name
+        )
+        
+        let v: Viewer
+        do {
+            v = try await parseViewer()
+        } catch let error as any AbortError where error.status == .unauthorized {
+            return try .json(content: SuccessResult(data: MeResult(
+                tenant: td,
+                me: nil,
+                role: "none",
+                logged_in: false
+            )))
+        } catch {
+            throw error
+        }
+        
+        if v.role == .admin || v.role == .organizer {
+            return try .json(content: SuccessResult(data: MeResult(
+                tenant: td,
+                me: nil,
+                role: v.role.rawValue,
+                logged_in: true
+            )))
+        }
+        
+        return try await connectToTenantDB(id: v.tenantID) { tenantDB in
+            guard let p = try await retrievePlayer(tenantDB: tenantDB.sql(), id: v.playerID) else {
+                return try .json(content: SuccessResult(data: MeResult(
+                    tenant: td,
+                    me: nil,
+                    role: "none",
+                    logged_in: false
+                )))
+            }
+            
+            return try .json(content: SuccessResult(data: MeResult(
+                tenant: td,
+                me: PlayerDetail(
+                    id: p.id,
+                    display_name: p.display_name,
+                    is_disqualified: p.is_disqualified
+                ),
+                role: v.role.rawValue,
+                logged_in: true
+            )))
+        }
     }
     
     struct InitializeResult: Encodable {
@@ -819,5 +1073,10 @@ extension Response {
     }
 }
 
+struct UncheckedBox<T>: @unchecked Sendable {
+    var value: T
+}
+
 extension AbsolutePath: @unchecked Sendable {}
 extension RelativePath: @unchecked Sendable {}
+extension SQLiteConnection: @unchecked Sendable {}
