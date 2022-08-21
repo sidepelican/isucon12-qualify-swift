@@ -65,6 +65,20 @@ final class CacheControlPrivateMiddleware: Middleware {
     }
 }
 
+func errorResponseHandler(request: Request, error: any Error) -> Response {
+    request.logger.report(error: error)
+
+    let status: HTTPResponseStatus
+    switch error {
+    case let abort as AbortError:
+        status = abort.status
+    default:
+        status = .internalServerError
+    }
+        
+    return try! .json(status: status, content: FailureResult(message: ""))
+}
+
 @main struct Main {
     static func main() async throws {
         LoggingSystem.bootstrap { label in
@@ -84,9 +98,15 @@ final class CacheControlPrivateMiddleware: Middleware {
         defer { app.shutdown() }
         
         app.http.server.configuration.port = Int(getEnv(key: "SERVER_APP_PORT", defaultValue: "3000"))!
-        app.middleware.use(CacheControlPrivateMiddleware())
+        app.middleware = {
+            var middlewares = Middlewares()
+            middlewares.use(RouteLoggingMiddleware(logLevel: .info))
+            middlewares.use(ErrorMiddleware(errorResponseHandler))
+            middlewares.use(CacheControlPrivateMiddleware())
+            return middlewares
+        }()
         
-        func route(_ route: @escaping @Sendable (Handler.Type) -> ((Handler) -> () async throws -> Response)) -> (Request) async throws -> Response {
+        func route(_ route: @escaping @Sendable (Handler.Type) -> (Handler) -> () async throws -> Response) -> (Request) async throws -> Response {
             { request in
                 let handler = Handler(
                     request: request,
@@ -99,31 +119,31 @@ final class CacheControlPrivateMiddleware: Middleware {
         }
         
         // SaaS管理者向けAPI
-        app.post("/api/admin/tenants/add", use: route { $0.tenantsAdd })
-        app.get("/api/admin/tenants/billing", use: route { $0.tenantsBilling })
+        app.post("api/admin/tenants/add", use: route { $0.tenantsAdd })
+        app.get("api/admin/tenants/billing", use: route { $0.tenantsBilling })
 
         // テナント管理者向けAPI - 参加者追加、一覧、失格
-        app.get("/api/organizer/players", use: route { $0.playersList })
-        app.post("/api/organizer/players/add", use: route { $0.playersAdd })
-        app.post("/api/organizer/player/:player_id/disqualified", use: route { $0.playerDisqualified })
+        app.get("api/organizer/players", use: route { $0.playersList })
+        app.post("api/organizer/players/add", use: route { $0.playersAdd })
+        app.post("api/organizer/player/:player_id/disqualified", use: route { $0.playerDisqualified })
 
         // テナント管理者向けAPI - 大会管理
-        app.post("/api/organizer/competitions/add", use: route { $0.competitionsAdd })
-        app.post("/api/organizer/competition/:competition_id/finish", use: route { $0.competitionFinish })
-        app.post("/api/organizer/competition/:competition_id/score", use: route { $0.competitionScore })
-        app.get("/api/organizer/billing", use: route { $0.billing })
-        app.get("/api/organizer/competitions", use: route { $0.organizerCompetitions })
+        app.post("api/organizer/competitions/add", use: route { $0.competitionsAdd })
+        app.post("api/organizer/competition/:competition_id/finish", use: route { $0.competitionFinish })
+        app.post("api/organizer/competition/:competition_id/score", use: route { $0.competitionScore })
+        app.get("api/organizer/billing", use: route { $0.billing })
+        app.get("api/organizer/competitions", use: route { $0.organizerCompetitions })
 
         // 参加者向けAPI
-        app.get("/api/player/player/:player_id", use: route { $0.player })
-        app.get("/api/player/competition/:competition_id/ranking", use: route { $0.competitionRanking })
-        app.get("/api/player/competitions", use: route { $0.playerCompetitions })
+        app.get("api/player/player/:player_id", use: route { $0.player })
+        app.get("api/player/competition/:competition_id/ranking", use: route { $0.competitionRanking })
+        app.get("api/player/competitions", use: route { $0.playerCompetitions })
 
         // 全ロール及び未認証でも使えるhandler
-        app.get("/api/me", use: route { $0.me })
+        app.get("api/me", use: route { $0.me })
 
         // ベンチマーカー向けAPI
-        app.post("/initialize", use: route { $0.initialize })
+        app.post("initialize", use: route { $0.initialize })
         
         try app.start()
         try await app.running?.onStop.get()
@@ -375,11 +395,14 @@ struct Handler {
     }
     
     // 排他ロックする
-    func flockByTenantID<T>(tenantID: Int64, _ body: () throws -> T) throws -> T {
+    func flockByTenantID(tenantID: Int64) async throws -> () -> () {
         let p = lockFilePath(id: tenantID)
         
-        let fl = FileLock(at: p)
-        return try fl.withLock(type: .exclusive, body)
+        return try await threadPool.task {
+            let fl = FileLock(at: p)
+            try fl.lock(type: .exclusive)
+            return fl.unlock
+        }
     }
     
     struct TenantsAddResult: Encodable {
@@ -390,15 +413,74 @@ struct Handler {
     // テナントを追加する
     // POST /api/admin/tenants/add
     func tenantsAdd() async throws -> Response {
-        return try .json(content: SuccessResult())
+        let v = try await parseViewer()
+        guard v.tenantName == "admin" else {
+            // admin: SaaS管理者用の特別なテナント名
+            throw Abort(.notFound, reason: "\(v.tenantName) has not this API")
+        }
+        guard v.role == .admin else {
+            throw Abort(.forbidden, reason: "admin role required")
+        }
+
+        struct Form: Decodable {
+            var display_name: String
+            var name: String
+        }
+        let form = try request.content.decode(Form.self)
+        do {
+            try validateTenantName(name: form.name)
+        } catch {
+            throw Abort(.badRequest, reason: "\(error)")
+        }
+
+        var lastInsertID: UInt64?
+        do {
+            let now = Date()
+            try await adminDB
+                .query(
+                    "INSERT INTO tenant (name, display_name, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                    [.init(string: form.name), .init(string: form.display_name), .init(date: now),  .init(date: now)],
+                    onRow: { _ in },
+                    onMetadata: { metadata in
+                        lastInsertID = metadata.lastInsertID
+                    }
+                )
+                .get()
+        } catch {
+            if let mysqlError = error as? MySQLError,
+               case .server(let errPacket) = mysqlError,
+               errPacket.errorCode == .DUP_ENTRY {
+                throw Abort(.badRequest, reason: "duplicate tenant")
+            } else {
+                throw error
+            }
+        }
+        
+        guard let id = lastInsertID.map({ Int64(clamping: $0) }) else {
+            throw StringError("error get lastInsertId")
+        }
+
+        // NOTE: 先にadminDBに書き込まれることでこのAPIの処理中に
+        //       /api/admin/tenants/billingにアクセスされるとエラーになりそう
+        //       ロックなどで対処したほうが良さそう
+        try await createTenantDB(id: id)
+
+        let res = TenantsAddResult(
+            tenant: .init(
+                id: String(id),
+                name: form.name,
+                display_name: form.display_name,
+                billing: 0
+            )
+        )
+        return try .json(content: SuccessResult(data: res))
     }
     
     // テナント名が規則に沿っているかチェックする
     func validateTenantName(name: String) throws {
-        if !name.matches(of: tenantNameRegexp).isEmpty {
-            return
+        guard !name.matches(of: tenantNameRegexp).isEmpty else {
+            throw StringError("invalid tenant name: \(name)")
         }
-        throw StringError("invalid tenant name: \(name)")
     }
     
     struct BillingReport: Encodable {
@@ -426,7 +508,61 @@ struct Handler {
     
     // 大会ごとの課金レポートを計算する
     func billingReportByCompetition(tenantDB: some SQLDatabase, tenantID: Int64, competitonID: String) async throws -> BillingReport {
-        fatalError("TODO")
+        guard let comp = try await retrieveCompetition(tenantDB: tenantDB, id: competitonID) else {
+            throw StringError("error retrieveCompetition")
+        }
+        
+        // ランキングにアクセスした参加者のIDを取得する
+        let vhs = try await adminDB.sql().execute(
+            "SELECT player_id, MIN(created_at) AS min_created_at FROM visit_history WHERE tenant_id = \(bind: tenantID) AND competition_id = \(bind: comp.id) GROUP BY player_id"
+        ).all(decoding: VisitHistorySummaryRow.self)
+        
+        
+        var billingMap: [String: String] = [:]
+        for vh in vhs {
+            // competition.finished_atよりもあとの場合は、終了後に訪問したとみなして大会開催内アクセス済みとみなさない
+            if let finished_at = comp.finished_at, finished_at < vh.min_created_at {
+                continue
+            }
+            billingMap[vh.player_id] = "visitor"
+        }
+        
+        // player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
+        let unlock = try await flockByTenantID(tenantID: tenantID)
+        defer { unlock() }
+        
+        // スコアを登録した参加者のIDを取得する
+        let scoredPlayerIDs = try await tenantDB.execute(
+            "SELECT DISTINCT(player_id) FROM player_score WHERE tenant_id = \(bind: tenantID) AND competition_id = \(bind: comp.id)"
+        ).all(collecting: { (playerID: String) in playerID })
+    
+        for pid in scoredPlayerIDs {
+            // スコアが登録されている参加者
+            billingMap[pid] = "player"
+        }
+        
+        // 大会が終了している場合のみ請求金額が確定するので計算する
+        var playerCount: Int64 = 0
+        var visitorCount: Int64 = 0
+        if comp.finished_at != nil {
+            for (_, category) in billingMap {
+                if category == "player" {
+                    playerCount += 1
+                } else if category == "visitor" {
+                    visitorCount += 1
+                }
+            }
+        }
+        
+        return BillingReport(
+            competition_id: comp.id,
+            competition_title: comp.title,
+            player_count: playerCount,
+            visitor_count: visitorCount,
+            billing_player_yen: 100 * playerCount, // スコアを登録した参加者は100円
+            billing_visitor_yen: 10 * visitorCount, // ランキングを閲覧だけした(スコアを登録していない)参加者は10円
+            billing_yen: 100 * playerCount + 10 * visitorCount
+        )
     }
     
     struct TenantWithBilling: Encodable {
@@ -445,7 +581,7 @@ struct Handler {
     // GET /api/admin/tenants/billing
     // URL引数beforeを指定した場合、指定した値よりもidが小さいテナントの課金レポートを取得する
     func tenantsBilling() async throws -> Response {
-        return try .json(content: SuccessResult())
+        return try .json(content: SuccessResult(data: "TODO"))
     }
     
     struct PlayerDetail: Encodable {
@@ -462,7 +598,7 @@ struct Handler {
     // GET /api/organizer/players
     // 参加者一覧を返す
     func playersList() async throws -> Response {
-        return try .json(content: SuccessResult())
+        return try .json(content: SuccessResult(data: "TODO"))
     }
     
     struct PlayersAddResult: Encodable {
@@ -473,7 +609,7 @@ struct Handler {
     // GET /api/organizer/players/add
     // テナントに参加者を追加する
     func playersAdd() async throws -> Response {
-        return try .json(content: SuccessResult())
+        return try .json(content: SuccessResult(data: "TODO"))
     }
     
     struct PlayerDisqualifiedResult: Encodable {
@@ -484,7 +620,7 @@ struct Handler {
     // POST /api/organizer/player/:player_id/disqualified
     // 参加者を失格にする
     func playerDisqualified() async throws -> Response {
-        return try .json(content: SuccessResult())
+        return try .json(content: SuccessResult(data: "TODO"))
     }
     
     struct CompetitionDetail: Encodable {
@@ -501,14 +637,14 @@ struct Handler {
     // POST /api/organizer/competitions/add
     // 大会を追加する
     func competitionsAdd() async throws -> Response {
-        return try .json(content: SuccessResult())
+        return try .json(content: SuccessResult(data: "TODO"))
     }
     
     // テナント管理者向けAPI
     // POST /api/organizer/competition/:competition_id/finish
     // 大会を終了する
     func competitionFinish() async throws -> Response {
-        return try .json(content: SuccessResult())
+        return try .json(content: SuccessResult(data: "TODO"))
     }
     
     struct ScoreResult: Encodable {
@@ -519,7 +655,7 @@ struct Handler {
     // POST /api/organizer/competition/:competition_id/score
     // 大会のスコアをCSVでアップロードする
     func competitionScore() async throws -> Response {
-        return try .json(content: SuccessResult())
+        return try .json(content: SuccessResult(data: "TODO"))
     }
     
     struct BillingResult: Encodable {
@@ -530,7 +666,7 @@ struct Handler {
     // GET /api/organizer/billing
     // テナント内の課金レポートを取得する
     func billing() async throws -> Response {
-        return try .json(content: SuccessResult())
+        return try .json(content: SuccessResult(data: "TODO"))
     }
     
     struct PlayerScoreDetail: Encodable {
@@ -547,7 +683,7 @@ struct Handler {
     // GET /api/player/player/:player_id
     // 参加者の詳細情報を取得する
     func player() async throws -> Response {
-        return try .json(content: SuccessResult())
+        return try .json(content: SuccessResult(data: "TODO"))
     }
     
     struct CompetitionRank: Encodable {
@@ -574,7 +710,7 @@ struct Handler {
     // GET /api/player/competition/:competition_id/ranking
     // 大会ごとのランキングを取得する
     func competitionRanking() async throws -> Response {
-        return try .json(content: SuccessResult())
+        return try .json(content: SuccessResult(data: "TODO"))
     }
 
     struct CompetitionsResult: Encodable {
@@ -585,14 +721,14 @@ struct Handler {
     // GET /api/player/competitions
     // 大会の一覧を取得する
     func playerCompetitions() async throws -> Response {
-        return try .json(content: SuccessResult())
+        return try .json(content: SuccessResult(data: "TODO"))
     }
     
     // テナント管理者向けAPI
     // GET /api/organizer/competitions
     // 大会の一覧を取得する
     func organizerCompetitions() async throws -> Response {
-        return try .json(content: SuccessResult())
+        return try .json(content: SuccessResult(data: "TODO"))
     }
     
     func competitions(viewer: Viewer, tenantDB: some SQLDatabase) async throws -> Response {
@@ -615,7 +751,7 @@ struct Handler {
     // GET /api/me
     // JWTで認証した結果、テナントやユーザ情報を返す
     func me() async throws -> Response {
-        return try .json(content: SuccessResult())
+        return try .json(content: SuccessResult(data: "TODO"))
     }
     
     struct InitializeResult: Encodable {
@@ -627,20 +763,18 @@ struct Handler {
     // ベンチマーカーが起動したときに最初に呼ぶ
     // データベースの初期化などが実行されるため、スキーマを変更した場合などは適宜改変すること
     func initialize() async throws -> Response {
-        return try .json(content: SuccessResult())
+        return try .json(content: SuccessResult(data: "TODO"))
     }
 }
 
 extension NIOThreadPool {
-    func task<T>(_ task: @escaping @Sendable () throws -> T) async throws -> T {
+    func task<T>(_ task: @escaping () throws -> T) async throws -> T {
         try await withCheckedThrowingContinuation { c in
             submit { state in
                 if state == .cancelled {
                     c.resume(throwing: CancellationError())
                 } else {
-                    c.resume(with: .init(catching: {
-                        try task()
-                    }))
+                    c.resume(with: Result(catching: task))
                 }
             }
         }
@@ -663,9 +797,23 @@ final class SQLExecuteBuilder: SQLQueryFetcher {
     }
 }
 
+extension SQLQueryFetcher {
+    func all<T, C0>(collecting: @escaping (C0) -> T) async throws -> [T] where C0: Decodable {
+        let all = try await self.all()
+        return try all.map { row in
+            let allColumns = row.allColumns
+            guard allColumns.count >= 1 else {
+                throw StringError("insufficient columns. count: \(allColumns.count)")
+            }
+            let c0 = try row.decode(column: allColumns[0], as: C0.self)
+            return collecting(c0)
+        }
+    }
+}
+
 extension Response {
-    static func json(content: some Encodable) throws -> Response {
-        let response = Response()
+    static func json(status: HTTPResponseStatus = .ok, content: some Encodable) throws -> Response {
+        let response = Response(status: status)
         try response.content.encode(content, as: .json)
         return response
     }
