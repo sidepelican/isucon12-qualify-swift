@@ -759,10 +759,8 @@ struct Handler {
         }
         
         return try await connectToTenantDB(id: v.tenantID) { tenantDB in
-            guard let playerID = request.parameters.get("player_id") else {
-                throw StringError("player_id not found")
-            }
-  
+            let playerID = request.parameters.get("player_id") ?? ""
+                    
             let now = Int64(Date().timeIntervalSince1970)
             try await tenantDB.sql().execute(
                 "UPDATE player SET is_disqualified = \(bind: true), updated_at = \(bind: now) WHERE id = \(bind: playerID)"
@@ -803,8 +801,28 @@ struct Handler {
             throw Abort(.forbidden, reason: "role organizer required")
         }
         
-        
-        return try .json(content: SuccessResult(data: "TODO"))
+        return try await connectToTenantDB(id: v.tenantID) { tenantDB in
+            struct Form: Decodable {
+                var title: String
+            }
+            let form = try request.content.decode(Form.self)
+            let title = form.title
+            
+            let now = Int64(Date().timeIntervalSince1970)
+            let id = try await dispenseID()
+            try await tenantDB.sql().execute(
+                "INSERT INTO competition (id, tenant_id, title, finished_at, created_at, updated_at) VALUES (\(bind: id), \(bind: v.tenantID), \(bind: title), \(bind: Int64?.none), \(bind: now), \(bind: now))"
+            ).run()
+            
+            let res = CompetitionsAddResult(
+                competition: CompetitionDetail(
+                    id: id,
+                    title: title,
+                    is_finished: false
+                )
+            )
+            return try .json(content: SuccessResult(data: res))
+        }
     }
     
     // テナント管理者向けAPI
@@ -815,8 +833,24 @@ struct Handler {
         guard v.role == .organizer else {
             throw Abort(.forbidden, reason: "role organizer required")
         }
-         
-        return try .json(content: SuccessResult(data: "TODO"))
+        
+        return try await connectToTenantDB(id: v.tenantID) { tenantDB in
+            guard let id = request.parameters.get("competition_id"), id != "" else {
+                throw Abort(.badRequest, reason: "competition_id required")
+            }
+            
+            guard let _ = try await retrieveCompetition(tenantDB: tenantDB.sql(), id: id) else {
+                // 存在しない大会
+                throw Abort(.notFound, reason: "competition not found")
+            }
+            
+            let now = Int64(Date().timeIntervalSince1970)
+            try await tenantDB.sql().execute(
+                "UPDATE competition SET finished_at = \(bind: now), updated_at = \(bind: now) WHERE id = \(bind: id)"
+            ).run()
+            
+            return try .json(content: SuccessResult())
+        }
     }
     
     struct ScoreResult: Encodable {
@@ -832,7 +866,130 @@ struct Handler {
             throw Abort(.forbidden, reason: "role organizer required")
         }
         
-        return try .json(content: SuccessResult(data: "TODO"))
+        return try await connectToTenantDB(id: v.tenantID) { tenantDB in
+            guard let id = request.parameters.get("competition_id"), id != "" else {
+                throw Abort(.badRequest, reason: "competition_id required")
+            }
+            guard let comp = try await retrieveCompetition(tenantDB: tenantDB.sql(), id: id) else {
+                // 存在しない大会
+                throw Abort(.notFound, reason: "competition not found")
+            }
+            if comp.finished_at != nil {
+                return try .json(content: FailureResult(
+                    message: "competition is finished"
+                ))
+            }
+            
+            struct Form: Decodable {
+                var scores: File
+            }
+            let form = try request.content.decode(Form.self)
+            
+            
+            
+            return try .json(content: SuccessResult(data: "TODO"))
+        }
+//
+//        fh, err := c.FormFile("scores")
+//        if err != nil {
+//            return fmt.Errorf("error c.FormFile(scores): %w", err)
+//        }
+//        f, err := fh.Open()
+//        if err != nil {
+//            return fmt.Errorf("error fh.Open FormFile(scores): %w", err)
+//        }
+//        defer f.Close()
+//
+//        r := csv.NewReader(f)
+//        headers, err := r.Read()
+//        if err != nil {
+//            return fmt.Errorf("error r.Read at header: %w", err)
+//        }
+//        if !reflect.DeepEqual(headers, []string{"player_id", "score"}) {
+//            return echo.NewHTTPError(http.StatusBadRequest, "invalid CSV headers")
+//        }
+//
+//        // / DELETEしたタイミングで参照が来ると空っぽのランキングになるのでロックする
+//        fl, err := flockByTenantID(v.tenantID)
+//        if err != nil {
+//            return fmt.Errorf("error flockByTenantID: %w", err)
+//        }
+//        defer fl.Close()
+//        var rowNum int64
+//        playerScoreRows := []PlayerScoreRow{}
+//        for {
+//            rowNum++
+//            row, err := r.Read()
+//            if err != nil {
+//                if err == io.EOF {
+//                    break
+//                }
+//                return fmt.Errorf("error r.Read at rows: %w", err)
+//            }
+//            if len(row) != 2 {
+//                return fmt.Errorf("row must have two columns: %#v", row)
+//            }
+//            playerID, scoreStr := row[0], row[1]
+//            if _, err := retrievePlayer(ctx, tenantDB, playerID); err != nil {
+//                // 存在しない参加者が含まれている
+//                if errors.Is(err, sql.ErrNoRows) {
+//                    return echo.NewHTTPError(
+//                        http.StatusBadRequest,
+//                        fmt.Sprintf("player not found: %s", playerID),
+//                    )
+//                }
+//                return fmt.Errorf("error retrievePlayer: %w", err)
+//            }
+//            var score int64
+//            if score, err = strconv.ParseInt(scoreStr, 10, 64); err != nil {
+//                return echo.NewHTTPError(
+//                    http.StatusBadRequest,
+//                    fmt.Sprintf("error strconv.ParseUint: scoreStr=%s, %s", scoreStr, err),
+//                )
+//            }
+//            id, err := dispenseID(ctx)
+//            if err != nil {
+//                return fmt.Errorf("error dispenseID: %w", err)
+//            }
+//            now := time.Now().Unix()
+//            playerScoreRows = append(playerScoreRows, PlayerScoreRow{
+//                ID:            id,
+//                TenantID:      v.tenantID,
+//                PlayerID:      playerID,
+//                CompetitionID: competitionID,
+//                Score:         score,
+//                RowNum:        rowNum,
+//                CreatedAt:     now,
+//                UpdatedAt:     now,
+//            })
+//        }
+//
+//        if _, err := tenantDB.ExecContext(
+//            ctx,
+//            "DELETE FROM player_score WHERE tenant_id = ? AND competition_id = ?",
+//            v.tenantID,
+//            competitionID,
+//        ); err != nil {
+//            return fmt.Errorf("error Delete player_score: tenantID=%d, competitionID=%s, %w", v.tenantID, competitionID, err)
+//        }
+//        for _, ps := range playerScoreRows {
+//            if _, err := tenantDB.NamedExecContext(
+//                ctx,
+//                "INSERT INTO player_score (id, tenant_id, player_id, competition_id, score, row_num, created_at, updated_at) VALUES (:id, :tenant_id, :player_id, :competition_id, :score, :row_num, :created_at, :updated_at)",
+//                ps,
+//            ); err != nil {
+//                return fmt.Errorf(
+//                    "error Insert player_score: id=%s, tenant_id=%d, playerID=%s, competitionID=%s, score=%d, rowNum=%d, createdAt=%d, updatedAt=%d, %w",
+//                    ps.ID, ps.TenantID, ps.PlayerID, ps.CompetitionID, ps.Score, ps.RowNum, ps.CreatedAt, ps.UpdatedAt, err,
+//                )
+//
+//            }
+//        }
+//
+//        return c.JSON(http.StatusOK, SuccessResult{
+//            Status: true,
+//            Data:   ScoreHandlerResult{Rows: int64(len(playerScoreRows))},
+//        })
     }
     
     struct BillingResult: Encodable {
@@ -848,7 +1005,21 @@ struct Handler {
             throw Abort(.forbidden, reason: "role organizer required")
         }
         
-        return try .json(content: SuccessResult(data: "TODO"))
+        return try await connectToTenantDB(id: v.tenantID) { tenantDB in
+            let cs = try await tenantDB.sql().execute(
+                "SELECT * FROM competition WHERE tenant_id=\(bind: v.tenantID) ORDER BY created_at DESC"
+            ).all(decoding: CompetitionRow.self)
+            
+            var tbrs: [BillingReport] = []
+            tbrs.reserveCapacity(cs.count)
+            for comp in cs {
+                let report = try await billingReportByCompetition(tenantDB: tenantDB.sql(), tenantID: v.tenantID, competitonID: comp.id)
+                tbrs.append(report)
+            }
+            
+            let res = BillingResult(reports: tbrs)
+            return try .json(content: SuccessResult(data: res))
+        }
     }
     
     struct PlayerScoreDetail: Encodable {
@@ -870,7 +1041,58 @@ struct Handler {
             throw Abort(.forbidden, reason: "role player required")
         }
         
-        return try .json(content: SuccessResult(data: "TODO"))
+        return try await connectToTenantDB(id: v.tenantID) { tenantDB in
+            try await authorizePlayer(tenantDB: tenantDB.sql(), id: v.playerID)
+            
+            guard let playerID = request.parameters.get("player_id"), playerID != "" else {
+                throw Abort(.badRequest, reason: "player_id is required")
+            }
+            guard let p = try await retrievePlayer(tenantDB: tenantDB.sql(), id: playerID) else {
+                throw Abort(.notFound, reason: "player not found")
+            }
+            let cs = try await tenantDB.sql().execute(
+                "SELECT * FROM competition WHERE tenant_id = \(bind: v.tenantID) ORDER BY created_at ASC"
+            ).all(decoding: CompetitionRow.self)
+            
+            // player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
+            let unlock = try await flockByTenantID(tenantID: v.tenantID)
+            defer { unlock() }
+            
+            var pss: [PlayerScoreRow] = []
+            pss.reserveCapacity(cs.count)
+            for c in cs {
+                // 最後にCSVに登場したスコアを採用する = row_numが一番大きいもの
+                guard let ps = try await tenantDB.sql().execute(
+                    "SELECT * FROM player_score WHERE tenant_id = \(bind: v.tenantID) AND competition_id = \(bind: c.id) AND player_id = \(bind: p.id) ORDER BY row_num DESC LIMIT 1"
+                ).first(decoding: PlayerScoreRow.self) else {
+                    // 行がない = スコアが記録されてない
+                    continue
+                }
+                pss.append(ps)
+            }
+            
+            var psds: [PlayerScoreDetail] = []
+            psds.reserveCapacity(pss.count)
+            for ps in pss {
+                guard let comp = try await retrieveCompetition(tenantDB: tenantDB.sql(), id: ps.competition_id) else {
+                    throw StringError("error retrieveCompetition")
+                }
+                psds.append(PlayerScoreDetail(
+                    competition_title: comp.title,
+                    score: ps.score
+                ))
+            }
+            
+            let res = PlayerResult(
+                player: .init(
+                    id: p.id,
+                    display_name: p.display_name,
+                    is_disqualified: p.is_disqualified
+                ),
+                scores: psds
+            )
+            return try .json(content: SuccessResult(data: res))
+        }
     }
     
     struct CompetitionRank: Encodable {
@@ -902,7 +1124,94 @@ struct Handler {
             throw Abort(.forbidden, reason: "role player required")
         }
         
-        return try .json(content: SuccessResult(data: "TODO"))
+        return try await connectToTenantDB(id: v.tenantID) { tenantDB in
+            try await authorizePlayer(tenantDB: tenantDB.sql(), id: v.playerID)
+            
+            guard let competitionID = request.parameters.get("competition_id"), competitionID != "" else {
+                throw Abort(.badRequest, reason: "competition_id required")
+            }
+            
+            // 大会の存在確認
+            guard let competition = try await retrieveCompetition(tenantDB: tenantDB.sql(), id: competitionID) else {
+                throw Abort(.notFound, reason: "competition not found")
+            }
+            
+            let now = Int64(Date().timeIntervalSince1970)
+            guard let tenant = try await adminDB.sql().execute(
+                "SELECT * FROM tenant WHERE id = \(bind: v.tenantID)"
+            ).first(decoding: TenantRow.self) else {
+                throw StringError("tenant not found")
+            }
+            
+            try await adminDB.sql().execute(
+                "INSERT INTO visit_history (player_id, tenant_id, competition_id, created_at, updated_at) VALUES (\(bind: v.playerID), \(bind: tenant.id), \(bind: competitionID), \(bind: now), \(bind: now)"
+            ).run()
+            
+            let rankAfter = (try? request.query.get(Int64.self, at: "rank_after")) ?? 0
+            
+            // player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
+            let unlock = try await flockByTenantID(tenantID: v.tenantID)
+            defer { unlock () }
+            let pss = try await tenantDB.sql().execute(
+                "SELECT * FROM player_score WHERE tenant_id = \(bind: tenant.id) AND competition_id = \(bind: competitionID) ORDER BY row_num DESC"
+            ).all(decoding: PlayerScoreRow.self)
+            var ranks: [CompetitionRank] = []
+            ranks.reserveCapacity(pss.count)
+            var scoredPlayerSet: Set<String> = []
+            scoredPlayerSet.reserveCapacity(pss.count)
+            for ps in pss {
+                // player_scoreが同一player_id内ではrow_numの降順でソートされているので
+                // 現れたのが2回目以降のplayer_idはより大きいrow_numでスコアが出ているとみなせる
+                if scoredPlayerSet.contains(ps.player_id) {
+                    continue
+                }
+                scoredPlayerSet.insert(ps.player_id)
+                guard let p = try await retrievePlayer(tenantDB: tenantDB.sql(), id: ps.player_id) else {
+                    throw StringError("error retrievePlayer")
+                }
+                ranks.append(CompetitionRank(
+                    rank: 0,
+                    score: ps.score,
+                    player_id: p.id,
+                    player_display_name: p.display_name,
+                    rowNum: ps.row_num
+                ))
+            }
+            ranks.sort { lhs, rhs in
+                if lhs.score == rhs.score {
+                    return lhs.rowNum < rhs.rowNum
+                }
+                return lhs.score > rhs.score
+            }
+            var pagedRanks: [CompetitionRank] = []
+            pagedRanks.reserveCapacity(100)
+            for (i, rank) in ranks.enumerated() {
+                let i = Int64(i)
+                if i < rankAfter {
+                    continue
+                }
+                pagedRanks.append(CompetitionRank(
+                    rank: i + 1,
+                    score: rank.score,
+                    player_id: rank.player_id,
+                    player_display_name: rank.player_display_name,
+                    rowNum: 0
+                ))
+                if pagedRanks.count >= 100 {
+                    break
+                }
+            }
+            
+            let res = CompetitionRankingResult(
+                competition: .init(
+                    id: competition.id,
+                    title: competition.title,
+                    is_finished: competition.finished_at != nil
+                ),
+                ranks: pagedRanks
+            )
+            return try .json(content: SuccessResult(data: res))
+        }
     }
 
     struct CompetitionsResult: Encodable {
@@ -918,7 +1227,10 @@ struct Handler {
             throw Abort(.forbidden, reason: "role player required")
         }
         
-        return try .json(content: SuccessResult(data: "TODO"))
+        return try await connectToTenantDB(id: v.tenantID) { tenantDB in
+            try await authorizePlayer(tenantDB: tenantDB.sql(), id: v.playerID)
+            return try await competitions(viewer: v, tenantDB: tenantDB.sql())
+        }
     }
     
     // テナント管理者向けAPI
@@ -930,11 +1242,26 @@ struct Handler {
             throw Abort(.forbidden, reason: "role organizer required")
         }
         
-        return try .json(content: SuccessResult(data: "TODO"))
+        return try await connectToTenantDB(id: v.tenantID) { tenantDB in
+            return try await competitions(viewer: v, tenantDB: tenantDB.sql())
+        }
     }
     
     func competitions(viewer: Viewer, tenantDB: some SQLDatabase) async throws -> Response {
-        fatalError("TODO")
+        let cs = try await tenantDB.execute(
+            "SELECT * FROM competition WHERE tenant_id=\(bind: viewer.tenantID) ORDER BY created_at DESC"
+        ).all(decoding: CompetitionRow.self)
+        
+        let cds = cs.map { comp in
+            CompetitionDetail(
+                id: comp.id,
+                title: comp.title,
+                is_finished: comp.finished_at != nil
+            )
+        }
+        
+        let ret = CompetitionsResult(competitions: cds)
+        return try .json(content: SuccessResult(data: ret))
     }
     
     struct TenantDetail: Encodable {
@@ -1017,7 +1344,15 @@ struct Handler {
     // ベンチマーカーが起動したときに最初に呼ぶ
     // データベースの初期化などが実行されるため、スキーマを変更した場合などは適宜改変すること
     func initialize() async throws -> Response {
-        return try .json(content: SuccessResult(data: "TODO"))
+        try await threadPool.task {
+            let result = try Process.popen(args: initializeScript)
+            guard result.exitStatus == .terminated(code: 0) else {
+                throw StringError("errro exec command: \(initializeScript), out=\(try result.utf8Output()), err=\(try result.utf8stderrOutput())")
+            }
+        }
+        
+        let res = InitializeResult(lang: "swift")
+        return try .json(content: SuccessResult(data: res))
     }
 }
 
