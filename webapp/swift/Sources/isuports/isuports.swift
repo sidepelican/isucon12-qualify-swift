@@ -1,3 +1,4 @@
+import CSV
 import MySQLKit
 import SQLiteKit
 import JWTKit
@@ -13,6 +14,13 @@ enum Role: String, Codable {
     case admin
     case organizer
     case player
+}
+
+struct InternalError: CustomStringConvertible, Error {
+    var description: String
+    init(_ description: String) {
+        self.description = description
+    }
 }
 
 // 環境変数を取得する、なければデフォルト値を返す
@@ -119,28 +127,28 @@ func errorResponseHandler(request: Request, error: any Error) -> Response {
         }
         
         // SaaS管理者向けAPI
-        app.post("api/admin/tenants/add", use: route { $0.tenantsAdd })
-        app.get("api/admin/tenants/billing", use: route { $0.tenantsBilling })
+        app.post("api", "admin", "tenants", "add", use: route { $0.tenantsAdd })
+        app.get("api", "admin", "tenants", "billing", use: route { $0.tenantsBilling })
 
         // テナント管理者向けAPI - 参加者追加、一覧、失格
-        app.get("api/organizer/players", use: route { $0.playersList })
-        app.post("api/organizer/players/add", use: route { $0.playersAdd })
-        app.post("api/organizer/player/:player_id/disqualified", use: route { $0.playerDisqualified })
+        app.get("api", "organizer", "players", use: route { $0.playersList })
+        app.post("api", "organizer", "players", "add", use: route { $0.playersAdd })
+        app.post("api", "organizer", "player", ":player_id", "disqualified", use: route { $0.playerDisqualified })
 
         // テナント管理者向けAPI - 大会管理
-        app.post("api/organizer/competitions/add", use: route { $0.competitionsAdd })
-        app.post("api/organizer/competition/:competition_id/finish", use: route { $0.competitionFinish })
-        app.post("api/organizer/competition/:competition_id/score", use: route { $0.competitionScore })
-        app.get("api/organizer/billing", use: route { $0.billing })
-        app.get("api/organizer/competitions", use: route { $0.organizerCompetitions })
+        app.post("api", "organizer", "competitions", "add", use: route { $0.competitionsAdd })
+        app.post("api", "organizer", "competition", ":competition_id", "finish", use: route { $0.competitionFinish })
+        app.post("api", "organizer", "competition", ":competition_id", "score", use: route { $0.competitionScore })
+        app.get("api", "organizer", "billing", use: route { $0.billing })
+        app.get("api", "organizer", "competitions", use: route { $0.organizerCompetitions })
 
         // 参加者向けAPI
-        app.get("api/player/player/:player_id", use: route { $0.player })
-        app.get("api/player/competition/:competition_id/ranking", use: route { $0.competitionRanking })
-        app.get("api/player/competitions", use: route { $0.playerCompetitions })
+        app.get("api", "player", "player", ":player_id", use: route { $0.player })
+        app.get("api", "player", "competition", ":competition_id", "ranking", use: route { $0.competitionRanking })
+        app.get("api", "player", "competitions", use: route { $0.playerCompetitions })
 
         // 全ロール及び未認証でも使えるhandler
-        app.get("api/me", use: route { $0.me })
+        app.get("api", "me", use: route { $0.me })
 
         // ベンチマーカー向けAPI
         app.post("initialize", use: route { $0.initialize })
@@ -226,7 +234,7 @@ struct Handler {
         try await threadPool.task {
             let result = try Process.popen(args: "sh", "-c", "sqlite3 \(path) < \(tenantDBSchemaFilePath)")
             guard result.exitStatus == .terminated(code: 0) else {
-                throw StringError("failed to exec sqlite3 \(path) < \(tenantDBSchemaFilePath), out=\(try result.utf8Output()), err=\(try result.utf8stderrOutput())")
+                throw InternalError("failed to exec sqlite3 \(path) < \(tenantDBSchemaFilePath), out=\(try result.utf8Output()), err=\(try result.utf8stderrOutput())")
             }
         }
     }
@@ -246,20 +254,20 @@ struct Handler {
                 if let mysqlError = error as? MySQLError,
                    case .server(let errPacket) = mysqlError,
                    errPacket.errorCode == .LOCK_DEADLOCK {
-                    lastError = StringError("error REPLACE INTO id_generator: \(error)")
+                    lastError = InternalError("error REPLACE INTO id_generator: \(error)")
                     continue
                 } else {
-                    throw StringError("error REPLACE INTO id_generator: \(error)")
+                    throw InternalError("error REPLACE INTO id_generator: \(error)")
                 }
             }
             
             if let lastInsertID {
                 return String(lastInsertID)
             } else {
-                throw StringError("error lastInsertID is nil")
+                throw InternalError("error lastInsertID is nil")
             }
         }
-        throw lastError ?? StringError("unexpected")
+        throw lastError ?? InternalError("unexpected")
     }
     
     // アクセスしてきた人の情報
@@ -274,9 +282,11 @@ struct Handler {
         var sub: String?
         var aud: [String]?
         var role: String?
+        var exp: ExpirationClaim
         
         func verify(using signer: JWTSigner) throws {
-            // 多言語の挙動に寄せるために検査はparseViewer内で行い、CodableやJWTKitの仕組みを使用しない
+            try exp.verifyNotExpired()
+            // 他言語の挙動に寄せるために検査はparseViewer内で行い、CodableやJWTKitの仕組みにあまり乗っからない
         }
     }
     
@@ -329,7 +339,7 @@ struct Handler {
     func retrieveTenantRowFromHeader() async throws -> TenantRow? {
         // JWTに入っているテナント名とHostヘッダのテナント名が一致しているか確認
         let baseHost = getEnv(key: "ISUCON_BASE_HOSTNAME", defaultValue: ".t.isucon.dev")
-        let host = request.url.host ?? ""
+        let host = request.headers.first(name: .host) ?? ""
         let tenantName = host.hasSuffix(baseHost)
         ? String(host[host.startIndex ..< host.index(host.endIndex, offsetBy: -baseHost.count)])
         : host
@@ -470,8 +480,7 @@ struct Handler {
                 .get()
         } catch {
             if let mysqlError = error as? MySQLError,
-               case .server(let errPacket) = mysqlError,
-               errPacket.errorCode == .DUP_ENTRY {
+               case .duplicateEntry = mysqlError {
                 throw Abort(.badRequest, reason: "duplicate tenant")
             } else {
                 throw error
@@ -479,7 +488,7 @@ struct Handler {
         }
         
         guard let id = lastInsertID.map({ Int64(clamping: $0) }) else {
-            throw StringError("error get lastInsertId")
+            throw InternalError("error get lastInsertId")
         }
 
         // NOTE: 先にadminDBに書き込まれることでこのAPIの処理中に
@@ -501,7 +510,7 @@ struct Handler {
     // テナント名が規則に沿っているかチェックする
     func validateTenantName(name: String) throws {
         guard !name.matches(of: tenantNameRegexp).isEmpty else {
-            throw StringError("invalid tenant name: \(name)")
+            throw InternalError("invalid tenant name: \(name)")
         }
     }
     
@@ -531,7 +540,7 @@ struct Handler {
     // 大会ごとの課金レポートを計算する
     func billingReportByCompetition(tenantDB: some SQLDatabase, tenantID: Int64, competitonID: String) async throws -> BillingReport {
         guard let comp = try await retrieveCompetition(tenantDB: tenantDB, id: competitonID) else {
-            throw StringError("error retrieveCompetition")
+            throw InternalError("error retrieveCompetition")
         }
         
         // ランキングにアクセスした参加者のIDを取得する
@@ -603,9 +612,10 @@ struct Handler {
     // GET /api/admin/tenants/billing
     // URL引数beforeを指定した場合、指定した値よりもidが小さいテナントの課金レポートを取得する
     func tenantsBilling() async throws -> Response {
-        guard let host = request.url.host,
+        let host = request.headers.first(name: .host) ?? ""
+        guard !host.isEmpty,
               host == getEnv(key: "ISUCON_ADMIN_HOSTNAME", defaultValue: "admin.t.isucon.dev") else {
-            throw Abort(.notFound, reason: "invalid hostname \(request.url.host ?? "")")
+            throw Abort(.notFound, reason: "invalid hostname \(host)")
         }
         
         let v = try await parseViewer()
@@ -731,7 +741,7 @@ struct Handler {
                 ).run()
                 
                 guard let p = try await retrievePlayer(tenantDB: tenantDB.sql(), id: id) else {
-                    throw StringError("error retrievePlayer")
+                    throw InternalError("error retrievePlayer")
                 }
                 pds.append(PlayerDetail(
                     id: p.id,
@@ -854,7 +864,7 @@ struct Handler {
     }
     
     struct ScoreResult: Encodable {
-        var rows: Int64
+        var rows: Int
     }
     
     // テナント管理者向けAPI
@@ -867,15 +877,15 @@ struct Handler {
         }
         
         return try await connectToTenantDB(id: v.tenantID) { tenantDB in
-            guard let id = request.parameters.get("competition_id"), id != "" else {
+            guard let competitionID = request.parameters.get("competition_id"), competitionID != "" else {
                 throw Abort(.badRequest, reason: "competition_id required")
             }
-            guard let comp = try await retrieveCompetition(tenantDB: tenantDB.sql(), id: id) else {
+            guard let comp = try await retrieveCompetition(tenantDB: tenantDB.sql(), id: competitionID) else {
                 // 存在しない大会
                 throw Abort(.notFound, reason: "competition not found")
             }
             if comp.finished_at != nil {
-                return try .json(content: FailureResult(
+                return try .json(status: .badRequest, content: FailureResult(
                     message: "competition is finished"
                 ))
             }
@@ -885,111 +895,58 @@ struct Handler {
             }
             let form = try request.content.decode(Form.self)
             
+            let reader = try CSVReader(
+                stream: InputStream(data: Data(buffer: form.scores.data)),
+                hasHeaderRow: true
+            )
+            guard reader.headerRow == ["player_id", "score"] else {
+                throw Abort(.badRequest, reason: "invalid CSV headers")
+            }
             
+            // DELETEしたタイミングで参照が来ると空っぽのランキングになるのでロックする
+            let unlock = try await flockByTenantID(tenantID: v.tenantID)
+            defer { unlock() }
+            var rowNum: Int64 = 0
+            var playerScoreRows: [PlayerScoreRow] = []
+            for row in reader {
+                rowNum += 1
+                guard row.count == 2 else {
+                    throw InternalError("row must have two columns: \(row)")
+                }
+                let playerID = row[0], score = Int64(row[1])
+                guard let _ = try await retrievePlayer(tenantDB: tenantDB.sql(), id: playerID) else {
+                    // 存在しない参加者が含まれている
+                    throw Abort(.badRequest, reason: "player not found: \(playerID)")
+                }
+                guard let score else {
+                    throw Abort(.badRequest, reason: "error Int64: scoreStr=\(row[1])")
+                }
+                let id = try await dispenseID()
+                let now = Int64(Date().timeIntervalSince1970)
+                playerScoreRows.append(PlayerScoreRow(
+                    tenant_id: v.tenantID,
+                    id: id,
+                    player_id: playerID,
+                    competition_id: competitionID,
+                    score: score,
+                    row_num: rowNum,
+                    created_at: now,
+                    updated_at: now
+                ))
+            }
             
-            return try .json(content: SuccessResult(data: "TODO"))
+            try await tenantDB.sql().execute(
+                "DELETE FROM player_score WHERE tenant_id = \(bind: v.tenantID) AND competition_id = \(bind: competitionID)"
+            ).run()
+            for ps in playerScoreRows {
+                try await tenantDB.sql().execute(
+                    "INSERT INTO player_score (id, tenant_id, player_id, competition_id, score, row_num, created_at, updated_at) VALUES (\(bind:ps.id), \(bind:ps.tenant_id), \(bind:ps.player_id), \(bind:ps.competition_id), \(bind:ps.score), \(bind:ps.row_num), \(bind:ps.created_at), \(bind:ps.updated_at))"
+                ).run()
+            }
+            
+            let res = ScoreResult(rows: playerScoreRows.count)
+            return try .json(content: SuccessResult(data: res))
         }
-//
-//        fh, err := c.FormFile("scores")
-//        if err != nil {
-//            return fmt.Errorf("error c.FormFile(scores): %w", err)
-//        }
-//        f, err := fh.Open()
-//        if err != nil {
-//            return fmt.Errorf("error fh.Open FormFile(scores): %w", err)
-//        }
-//        defer f.Close()
-//
-//        r := csv.NewReader(f)
-//        headers, err := r.Read()
-//        if err != nil {
-//            return fmt.Errorf("error r.Read at header: %w", err)
-//        }
-//        if !reflect.DeepEqual(headers, []string{"player_id", "score"}) {
-//            return echo.NewHTTPError(http.StatusBadRequest, "invalid CSV headers")
-//        }
-//
-//        // / DELETEしたタイミングで参照が来ると空っぽのランキングになるのでロックする
-//        fl, err := flockByTenantID(v.tenantID)
-//        if err != nil {
-//            return fmt.Errorf("error flockByTenantID: %w", err)
-//        }
-//        defer fl.Close()
-//        var rowNum int64
-//        playerScoreRows := []PlayerScoreRow{}
-//        for {
-//            rowNum++
-//            row, err := r.Read()
-//            if err != nil {
-//                if err == io.EOF {
-//                    break
-//                }
-//                return fmt.Errorf("error r.Read at rows: %w", err)
-//            }
-//            if len(row) != 2 {
-//                return fmt.Errorf("row must have two columns: %#v", row)
-//            }
-//            playerID, scoreStr := row[0], row[1]
-//            if _, err := retrievePlayer(ctx, tenantDB, playerID); err != nil {
-//                // 存在しない参加者が含まれている
-//                if errors.Is(err, sql.ErrNoRows) {
-//                    return echo.NewHTTPError(
-//                        http.StatusBadRequest,
-//                        fmt.Sprintf("player not found: %s", playerID),
-//                    )
-//                }
-//                return fmt.Errorf("error retrievePlayer: %w", err)
-//            }
-//            var score int64
-//            if score, err = strconv.ParseInt(scoreStr, 10, 64); err != nil {
-//                return echo.NewHTTPError(
-//                    http.StatusBadRequest,
-//                    fmt.Sprintf("error strconv.ParseUint: scoreStr=%s, %s", scoreStr, err),
-//                )
-//            }
-//            id, err := dispenseID(ctx)
-//            if err != nil {
-//                return fmt.Errorf("error dispenseID: %w", err)
-//            }
-//            now := time.Now().Unix()
-//            playerScoreRows = append(playerScoreRows, PlayerScoreRow{
-//                ID:            id,
-//                TenantID:      v.tenantID,
-//                PlayerID:      playerID,
-//                CompetitionID: competitionID,
-//                Score:         score,
-//                RowNum:        rowNum,
-//                CreatedAt:     now,
-//                UpdatedAt:     now,
-//            })
-//        }
-//
-//        if _, err := tenantDB.ExecContext(
-//            ctx,
-//            "DELETE FROM player_score WHERE tenant_id = ? AND competition_id = ?",
-//            v.tenantID,
-//            competitionID,
-//        ); err != nil {
-//            return fmt.Errorf("error Delete player_score: tenantID=%d, competitionID=%s, %w", v.tenantID, competitionID, err)
-//        }
-//        for _, ps := range playerScoreRows {
-//            if _, err := tenantDB.NamedExecContext(
-//                ctx,
-//                "INSERT INTO player_score (id, tenant_id, player_id, competition_id, score, row_num, created_at, updated_at) VALUES (:id, :tenant_id, :player_id, :competition_id, :score, :row_num, :created_at, :updated_at)",
-//                ps,
-//            ); err != nil {
-//                return fmt.Errorf(
-//                    "error Insert player_score: id=%s, tenant_id=%d, playerID=%s, competitionID=%s, score=%d, rowNum=%d, createdAt=%d, updatedAt=%d, %w",
-//                    ps.ID, ps.TenantID, ps.PlayerID, ps.CompetitionID, ps.Score, ps.RowNum, ps.CreatedAt, ps.UpdatedAt, err,
-//                )
-//
-//            }
-//        }
-//
-//        return c.JSON(http.StatusOK, SuccessResult{
-//            Status: true,
-//            Data:   ScoreHandlerResult{Rows: int64(len(playerScoreRows))},
-//        })
     }
     
     struct BillingResult: Encodable {
@@ -1075,7 +1032,7 @@ struct Handler {
             psds.reserveCapacity(pss.count)
             for ps in pss {
                 guard let comp = try await retrieveCompetition(tenantDB: tenantDB.sql(), id: ps.competition_id) else {
-                    throw StringError("error retrieveCompetition")
+                    throw InternalError("error retrieveCompetition")
                 }
                 psds.append(PlayerScoreDetail(
                     competition_title: comp.title,
@@ -1140,11 +1097,11 @@ struct Handler {
             guard let tenant = try await adminDB.sql().execute(
                 "SELECT * FROM tenant WHERE id = \(bind: v.tenantID)"
             ).first(decoding: TenantRow.self) else {
-                throw StringError("tenant not found")
+                throw InternalError("tenant not found")
             }
             
             try await adminDB.sql().execute(
-                "INSERT INTO visit_history (player_id, tenant_id, competition_id, created_at, updated_at) VALUES (\(bind: v.playerID), \(bind: tenant.id), \(bind: competitionID), \(bind: now), \(bind: now)"
+                "INSERT INTO visit_history (player_id, tenant_id, competition_id, created_at, updated_at) VALUES (\(bind: v.playerID), \(bind: tenant.id), \(bind: competitionID), \(bind: now), \(bind: now))"
             ).run()
             
             let rankAfter = (try? request.query.get(Int64.self, at: "rank_after")) ?? 0
@@ -1167,7 +1124,7 @@ struct Handler {
                 }
                 scoredPlayerSet.insert(ps.player_id)
                 guard let p = try await retrievePlayer(tenantDB: tenantDB.sql(), id: ps.player_id) else {
-                    throw StringError("error retrievePlayer")
+                    throw InternalError("error retrievePlayer")
                 }
                 ranks.append(CompetitionRank(
                     rank: 0,
@@ -1281,7 +1238,7 @@ struct Handler {
     // JWTで認証した結果、テナントやユーザ情報を返す
     func me() async throws -> Response {
         guard let tenant = try await retrieveTenantRowFromHeader() else {
-            throw StringError("error retrieveTenantRowFromHeader")
+            throw InternalError("error retrieveTenantRowFromHeader")
         }
         
         let td = TenantDetail(
@@ -1347,7 +1304,7 @@ struct Handler {
         try await threadPool.task {
             let result = try Process.popen(args: initializeScript)
             guard result.exitStatus == .terminated(code: 0) else {
-                throw StringError("errro exec command: \(initializeScript), out=\(try result.utf8Output()), err=\(try result.utf8stderrOutput())")
+                throw InternalError("errro exec command: \(initializeScript), out=\(try result.utf8Output()), err=\(try result.utf8stderrOutput())")
             }
         }
         
@@ -1392,7 +1349,7 @@ extension SQLQueryFetcher {
         return try all.map { row in
             let allColumns = row.allColumns
             guard allColumns.count >= 1 else {
-                throw StringError("insufficient columns. count: \(allColumns.count)")
+                throw InternalError("insufficient columns. count: \(allColumns.count)")
             }
             let c0 = try row.decode(column: allColumns[0], as: C0.self)
             return collecting(c0)
