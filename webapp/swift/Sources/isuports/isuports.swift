@@ -211,9 +211,10 @@ struct Handler {
                 try await closure.value(conn.value)
             }
             .flatMapAlways { (result) in
-                conn.value.close()
+                let result = UncheckedBox(value: result)
+                return conn.value.close()
                     .flatMapThrowing { () in
-                        try result.get()
+                        try result.value.get()
                     }
             }
         }
@@ -1308,7 +1309,7 @@ struct Handler {
 }
 
 extension NIOThreadPool {
-    func task<T>(_ task: @escaping () throws -> T) async throws -> T {
+    func task<T: Sendable>(_ task: @escaping @Sendable () throws -> T) async throws -> T {
         try await withCheckedThrowingContinuation { c in
             submit { state in
                 if state == .cancelled {
