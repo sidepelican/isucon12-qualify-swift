@@ -198,15 +198,6 @@ struct Handler {
     }
     
     // テナントDBに接続する
-    func connectToTenantDB(id: Int64) async throws -> SQLiteConnection {
-        try await SQLiteConnection.open(
-            storage: .file(path: tenantDBPath(id: id).pathString),
-            threadPool: threadPool,
-            on: eventLoopGroup.next()
-        ).get()
-    }
-    
-    // テナントDBに接続する
     func connectToTenantDB<T>(id: Int64, _ closure: @escaping (SQLiteConnection) async throws -> T) async throws -> T {
         let closure = UncheckedBox(value: closure)
         return try await SQLiteConnection.open(
@@ -215,11 +206,12 @@ struct Handler {
             on: eventLoopGroup.next()
         )
         .flatMapWithEventLoop { (conn: SQLiteConnection, eventLoop: EventLoop) in
-            eventLoop.performWithTask {
-                try await closure.value(conn)
+            let conn = UncheckedBox(value: conn)
+            return eventLoop.performWithTask {
+                try await closure.value(conn.value)
             }
             .flatMapAlways { (result) in
-                conn.close()
+                conn.value.close()
                     .flatMapThrowing { () in
                         try result.get()
                     }
@@ -429,12 +421,14 @@ struct Handler {
     // 排他ロックする
     func flockByTenantID(tenantID: Int64) async throws -> () -> () {
         let p = lockFilePath(id: tenantID)
-        
-        return try await threadPool.task {
-            let fl = FileLock(at: p)
-            try fl.lock(type: .exclusive)
-            return fl.unlock
-        }
+        let fl = FileLock(at: p)
+        let box = UncheckedBox(value: fl)
+
+        try await Task.detached(priority: .low) {
+            try box.value.lock(type: .exclusive)
+        }.value
+
+        return fl.unlock
     }
     
     struct TenantsAddResult: Encodable {
@@ -1371,4 +1365,3 @@ struct UncheckedBox<T>: @unchecked Sendable {
 
 extension AbsolutePath: @unchecked Sendable {}
 extension RelativePath: @unchecked Sendable {}
-extension SQLiteConnection: @unchecked Sendable {}
