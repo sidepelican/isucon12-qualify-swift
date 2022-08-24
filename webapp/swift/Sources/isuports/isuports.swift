@@ -539,18 +539,18 @@ struct Handler {
         }
         
         // ランキングにアクセスした参加者のIDを取得する
-        let vhs = try await adminDB.sql().execute(
+        let histories = try await adminDB.sql().execute(
             "SELECT player_id, MIN(created_at) AS min_created_at FROM visit_history WHERE tenant_id = \(bind: tenantID) AND competition_id = \(bind: comp.id) GROUP BY player_id"
         ).all(decoding: VisitHistorySummaryRow.self)
         
         
         var billingMap: [String: String] = [:]
-        for vh in vhs {
+        for history in histories {
             // competition.finished_atよりもあとの場合は、終了後に訪問したとみなして大会開催内アクセス済みとみなさない
-            if let finished_at = comp.finished_at, finished_at < vh.min_created_at {
+            if let finished_at = comp.finished_at, finished_at < history.min_created_at {
                 continue
             }
-            billingMap[vh.player_id] = "visitor"
+            billingMap[history.player_id] = "visitor"
         }
         
         // player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
@@ -630,35 +630,35 @@ struct Handler {
         //     scoreが登録されていないplayerでアクセスした人 * 10
         //   を合計したものを
         // テナントの課金とする
-        let ts = try await adminDB.sql().execute(
+        let tenants = try await adminDB.sql().execute(
             "SELECT * FROM tenant ORDER BY id DESC"
         ).all(decoding: TenantRow.self)
         
         var tenantBillings: [TenantWithBilling] = []
-        tenantBillings.reserveCapacity(ts.count)
+        tenantBillings.reserveCapacity(tenants.count)
         
-        for t in ts {
-            if beforeID != 0 && beforeID <= t.id {
+        for tenant in tenants {
+            if beforeID != 0 && beforeID <= tenant.id {
                 continue
             }
-            
-            let tb = try await connectToTenantDB(id: t.id) { tenantDB in
-                var tb = TenantWithBilling(
-                    id: String(t.id),
-                    name: t.name,
-                    display_name: t.display_name,
-                    billing: 0
-                )
+
+            let billingYen = try await connectToTenantDB(id: tenant.id) { tenantDB in
+                var billingYen: Int64 = 0
                 let cs = try await tenantDB.sql().execute(
-                    "SELECT * FROM competition WHERE tenant_id=\(bind: t.id)"
+                    "SELECT * FROM competition WHERE tenant_id=\(bind: tenant.id)"
                 ).all(decoding: CompetitionRow.self)
                 for comp in cs {
-                    let report = try await billingReportByCompetition(tenantDB: tenantDB.sql(), tenantID: t.id, competitonID: comp.id)
-                    tb.billing += report.billing_yen
+                    let report = try await billingReportByCompetition(tenantDB: tenantDB.sql(), tenantID: tenant.id, competitonID: comp.id)
+                    billingYen += report.billing_yen
                 }
-                return tb
+                return billingYen
             }
-            tenantBillings.append(tb)
+            tenantBillings.append(TenantWithBilling(
+                id: String(tenant.id),
+                name: tenant.name,
+                display_name: tenant.display_name,
+                billing: billingYen
+            ))
             
             if tenantBillings.count >= 10 {
                 break
@@ -691,12 +691,12 @@ struct Handler {
         }
         
         return try await connectToTenantDB(id: v.tenantID) { tenantDB in
-            let pls = try await tenantDB.sql().execute(
+            let players = try await tenantDB.sql().execute(
                 "SELECT * FROM player WHERE tenant_id=\(bind: v.tenantID) ORDER BY created_at DESC"
             ).all(decoding: PlayerRow.self)
     
             let res = PlayersListResult(
-                players: pls.map { p in
+                players: players.map { p in
                     PlayerDetail(id: p.id, display_name: p.display_name, is_disqualified: p.is_disqualified)
                 }
             )
@@ -724,8 +724,8 @@ struct Handler {
             let form = try request.content.decode(Form.self)
             let displayNames = form.display_name
             
-            var pds: [PlayerDetail] = []
-            pds.reserveCapacity(displayNames.count)
+            var playerDetails: [PlayerDetail] = []
+            playerDetails.reserveCapacity(displayNames.count)
             
             for displayName in displayNames {
                 let id = try await dispenseID()
@@ -738,14 +738,14 @@ struct Handler {
                 guard let p = try await retrievePlayer(tenantDB: tenantDB.sql(), id: id) else {
                     throw InternalError("error retrievePlayer")
                 }
-                pds.append(PlayerDetail(
+                playerDetails.append(PlayerDetail(
                     id: p.id,
                     display_name: p.display_name,
                     is_disqualified: p.is_disqualified
                 ))
             }
 
-            let res = PlayersAddResult(players: pds)
+            let res = PlayersAddResult(players: playerDetails)
             return try .json(content: SuccessResult(data: res))
         }
     }
@@ -958,18 +958,18 @@ struct Handler {
         }
         
         return try await connectToTenantDB(id: v.tenantID) { tenantDB in
-            let cs = try await tenantDB.sql().execute(
+            let competitions = try await tenantDB.sql().execute(
                 "SELECT * FROM competition WHERE tenant_id=\(bind: v.tenantID) ORDER BY created_at DESC"
             ).all(decoding: CompetitionRow.self)
             
-            var tbrs: [BillingReport] = []
-            tbrs.reserveCapacity(cs.count)
-            for comp in cs {
+            var reports: [BillingReport] = []
+            reports.reserveCapacity(competitions.count)
+            for comp in competitions {
                 let report = try await billingReportByCompetition(tenantDB: tenantDB.sql(), tenantID: v.tenantID, competitonID: comp.id)
-                tbrs.append(report)
+                reports.append(report)
             }
             
-            let res = BillingResult(reports: tbrs)
+            let res = BillingResult(reports: reports)
             return try .json(content: SuccessResult(data: res))
         }
     }
@@ -1002,7 +1002,7 @@ struct Handler {
             guard let p = try await retrievePlayer(tenantDB: tenantDB.sql(), id: playerID) else {
                 throw Abort(.notFound, reason: "player not found")
             }
-            let cs = try await tenantDB.sql().execute(
+            let competitions = try await tenantDB.sql().execute(
                 "SELECT * FROM competition WHERE tenant_id = \(bind: v.tenantID) ORDER BY created_at ASC"
             ).all(decoding: CompetitionRow.self)
             
@@ -1010,9 +1010,9 @@ struct Handler {
             let unlock = try await flockByTenantID(tenantID: v.tenantID)
             defer { unlock() }
             
-            var pss: [PlayerScoreRow] = []
-            pss.reserveCapacity(cs.count)
-            for c in cs {
+            var playerScores: [PlayerScoreRow] = []
+            playerScores.reserveCapacity(competitions.count)
+            for c in competitions {
                 // 最後にCSVに登場したスコアを採用する = row_numが一番大きいもの
                 guard let ps = try await tenantDB.sql().execute(
                     "SELECT * FROM player_score WHERE tenant_id = \(bind: v.tenantID) AND competition_id = \(bind: c.id) AND player_id = \(bind: p.id) ORDER BY row_num DESC LIMIT 1"
@@ -1020,16 +1020,16 @@ struct Handler {
                     // 行がない = スコアが記録されてない
                     continue
                 }
-                pss.append(ps)
+                playerScores.append(ps)
             }
             
-            var psds: [PlayerScoreDetail] = []
-            psds.reserveCapacity(pss.count)
-            for ps in pss {
+            var scoreDetails: [PlayerScoreDetail] = []
+            scoreDetails.reserveCapacity(playerScores.count)
+            for ps in playerScores {
                 guard let comp = try await retrieveCompetition(tenantDB: tenantDB.sql(), id: ps.competition_id) else {
                     throw InternalError("error retrieveCompetition")
                 }
-                psds.append(PlayerScoreDetail(
+                scoreDetails.append(PlayerScoreDetail(
                     competition_title: comp.title,
                     score: ps.score
                 ))
@@ -1041,7 +1041,7 @@ struct Handler {
                     display_name: p.display_name,
                     is_disqualified: p.is_disqualified
                 ),
-                scores: psds
+                scores: scoreDetails
             )
             return try .json(content: SuccessResult(data: res))
         }
@@ -1104,14 +1104,14 @@ struct Handler {
             // player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
             let unlock = try await flockByTenantID(tenantID: v.tenantID)
             defer { unlock () }
-            let pss = try await tenantDB.sql().execute(
+            let playerScores = try await tenantDB.sql().execute(
                 "SELECT * FROM player_score WHERE tenant_id = \(bind: tenant.id) AND competition_id = \(bind: competitionID) ORDER BY row_num DESC"
             ).all(decoding: PlayerScoreRow.self)
             var ranks: [CompetitionRank] = []
-            ranks.reserveCapacity(pss.count)
+            ranks.reserveCapacity(playerScores.count)
             var scoredPlayerSet: Set<String> = []
-            scoredPlayerSet.reserveCapacity(pss.count)
-            for ps in pss {
+            scoredPlayerSet.reserveCapacity(playerScores.count)
+            for ps in playerScores {
                 // player_scoreが同一player_id内ではrow_numの降順でソートされているので
                 // 現れたのが2回目以降のplayer_idはより大きいrow_numでスコアが出ているとみなせる
                 if scoredPlayerSet.contains(ps.player_id) {
@@ -1135,24 +1135,19 @@ struct Handler {
                 }
                 return lhs.score > rhs.score
             }
-            var pagedRanks: [CompetitionRank] = []
-            pagedRanks.reserveCapacity(100)
-            for (i, rank) in ranks.enumerated() {
-                let i = Int64(i)
-                if i < rankAfter {
-                    continue
+            let pagedRanks = ranks
+                .dropFirst(numericCast(rankAfter))
+                .prefix(100)
+                .enumerated()
+                .map { i, rank in
+                    CompetitionRank(
+                        rank: rankAfter + Int64(i) + 1,
+                        score: rank.score,
+                        player_id: rank.player_id,
+                        player_display_name: rank.player_display_name,
+                        rowNum: 0
+                    )
                 }
-                pagedRanks.append(CompetitionRank(
-                    rank: i + 1,
-                    score: rank.score,
-                    player_id: rank.player_id,
-                    player_display_name: rank.player_display_name,
-                    rowNum: 0
-                ))
-                if pagedRanks.count >= 100 {
-                    break
-                }
-            }
             
             let res = CompetitionRankingResult(
                 competition: .init(
@@ -1200,19 +1195,19 @@ struct Handler {
     }
     
     func competitions(viewer: Viewer, tenantDB: some SQLDatabase) async throws -> Response {
-        let cs = try await tenantDB.execute(
+        let competitions = try await tenantDB.execute(
             "SELECT * FROM competition WHERE tenant_id=\(bind: viewer.tenantID) ORDER BY created_at DESC"
         ).all(decoding: CompetitionRow.self)
-        
-        let cds = cs.map { comp in
-            CompetitionDetail(
-                id: comp.id,
-                title: comp.title,
-                is_finished: comp.finished_at != nil
-            )
-        }
-        
-        let ret = CompetitionsResult(competitions: cds)
+    
+        let ret = CompetitionsResult(
+            competitions: competitions.map { comp in
+                CompetitionDetail(
+                    id: comp.id,
+                    title: comp.title,
+                    is_finished: comp.finished_at != nil
+                )
+            }
+        )
         return try .json(content: SuccessResult(data: ret))
     }
     
@@ -1236,7 +1231,7 @@ struct Handler {
             throw InternalError("error retrieveTenantRowFromHeader")
         }
         
-        let td = TenantDetail(
+        let tenantDetail = TenantDetail(
             name: tenant.name,
             display_name: tenant.display_name
         )
@@ -1246,7 +1241,7 @@ struct Handler {
             v = try await parseViewer()
         } catch let error as any AbortError where error.status == .unauthorized {
             return try .json(content: SuccessResult(data: MeResult(
-                tenant: td,
+                tenant: tenantDetail,
                 me: nil,
                 role: "none",
                 logged_in: false
@@ -1257,7 +1252,7 @@ struct Handler {
         
         if v.role == .admin || v.role == .organizer {
             return try .json(content: SuccessResult(data: MeResult(
-                tenant: td,
+                tenant: tenantDetail,
                 me: nil,
                 role: v.role.rawValue,
                 logged_in: true
@@ -1267,7 +1262,7 @@ struct Handler {
         return try await connectToTenantDB(id: v.tenantID) { tenantDB in
             guard let p = try await retrievePlayer(tenantDB: tenantDB.sql(), id: v.playerID) else {
                 return try .json(content: SuccessResult(data: MeResult(
-                    tenant: td,
+                    tenant: tenantDetail,
                     me: nil,
                     role: "none",
                     logged_in: false
@@ -1275,7 +1270,7 @@ struct Handler {
             }
             
             return try .json(content: SuccessResult(data: MeResult(
-                tenant: td,
+                tenant: tenantDetail,
                 me: PlayerDetail(
                     id: p.id,
                     display_name: p.display_name,
