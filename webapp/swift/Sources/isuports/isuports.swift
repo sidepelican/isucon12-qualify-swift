@@ -113,14 +113,22 @@ func errorResponseHandler(request: Request, error: any Error) -> Response {
             middlewares.use(CacheControlPrivateMiddleware())
             return middlewares
         }()
+        app.routes.defaultMaxBodySize = "1mb"
         
+        let keyFilename = getEnv(key: "ISUCON_JWT_KEY_FILE", defaultValue: "../public.pem")
+        let keysrc = try Data(contentsOf: URL(fileURLWithPath: keyFilename))
+        let signer = JWTSigner.rs256(key: try .public(pem: keysrc))
+    
         func route(_ route: @escaping @Sendable (Handler.Type) -> (Handler) -> () async throws -> Response) -> (Request) async throws -> Response {
             { request in
+                var logger = request.logger
+                logger.logLevel = .error
                 let handler = Handler(
                     request: request,
-                    adminDB: pool.database(logger: request.logger),
+                    adminDB: pool.database(logger: logger),
                     threadPool: threadPool,
-                    eventLoopGroup: request.eventLoop
+                    eventLoopGroup: request.eventLoop,
+                    signer: signer
                 )
                 return try await route(Handler.self)(handler)()
             }
@@ -182,12 +190,7 @@ struct Handler {
     var adminDB: any MySQLDatabase
     var threadPool: NIOThreadPool
     var eventLoopGroup: any EventLoopGroup
-    init(request: Request, adminDB: any MySQLDatabase, threadPool: NIOThreadPool, eventLoopGroup: any EventLoopGroup) {
-        self.request = request
-        self.adminDB = adminDB
-        self.threadPool = threadPool
-        self.eventLoopGroup = eventLoopGroup
-    }
+    var signer: JWTSigner
     
     // テナントDBのパスを返す
     func tenantDBPath(id: Int64) -> AbsolutePath {
@@ -200,10 +203,12 @@ struct Handler {
     // テナントDBに接続する
     func connectToTenantDB<T>(id: Int64, _ closure: @escaping (SQLiteConnection) async throws -> T) async throws -> T {
         let closure = UncheckedBox(value: closure)
+        var logger = request.logger
+        logger.logLevel = .error
         return try await SQLiteConnection.open(
             storage: .file(path: tenantDBPath(id: id).pathString),
             threadPool: threadPool,
-            logger: request.logger,
+            logger: logger,
             on: eventLoopGroup.next()
         )
         .flatMapWithEventLoop { (conn: SQLiteConnection, eventLoop: EventLoop) in
@@ -234,34 +239,8 @@ struct Handler {
     }
     
     // システム全体で一意なIDを生成する
-    func dispenseID() async throws -> String {
-        var lastError: Error?
-        for _ in 0..<100 {
-            var lastInsertID: UInt64?
-            do {
-                try await adminDB
-                    .query("REPLACE INTO id_generator (stub) VALUES (?);", ["a"], onRow: { _ in }, onMetadata: { metadata in
-                        lastInsertID = metadata.lastInsertID
-                    })
-                    .get()
-            } catch {
-                if let mysqlError = error as? MySQLError,
-                   case .server(let errPacket) = mysqlError,
-                   errPacket.errorCode == .LOCK_DEADLOCK {
-                    lastError = InternalError("error REPLACE INTO id_generator: \(error)")
-                    continue
-                } else {
-                    throw InternalError("error REPLACE INTO id_generator: \(error)")
-                }
-            }
-            
-            if let lastInsertID {
-                return String(lastInsertID)
-            } else {
-                throw InternalError("error lastInsertID is nil")
-            }
-        }
-        throw lastError ?? InternalError("unexpected")
+    func dispenseID() -> String {
+        return UUID().uuidString
     }
     
     // アクセスしてきた人の情報
@@ -283,7 +262,7 @@ struct Handler {
             // 他言語の挙動に寄せるために検査はparseViewer内で行い、CodableやJWTKitの仕組みにあまり乗っからない
         }
     }
-    
+
     // リクエストヘッダをパースしてViewerを返す
     func parseViewer() async throws -> Viewer {
         guard let cookie = request.cookies[cookieName] else {
@@ -291,10 +270,6 @@ struct Handler {
         }
         let tokenString = cookie.string
         
-        let keyFilename = getEnv(key: "ISUCON_JWT_KEY_FILE", defaultValue: "../public.pem")
-        let keysrc = try Data(contentsOf: URL(fileURLWithPath: keyFilename))
-        
-        let signer = JWTSigner.rs256(key: try .public(pem: keysrc))
         let token: Claims
         do {
             token = try signer.verify(tokenString, as: Claims.self)
@@ -420,19 +395,6 @@ struct Handler {
             .appending(component: "\(id).lock")
     }
     
-    // 排他ロックする
-    func flockByTenantID(tenantID: Int64) async throws -> () -> () {
-        let p = lockFilePath(id: tenantID)
-        let fl = FileLock(at: p)
-        let box = UncheckedBox(value: fl)
-
-        try await Task.detached(priority: .low) {
-            try box.value.lock(type: .exclusive)
-        }.value
-
-        return fl.unlock
-    }
-    
     struct TenantsAddResult: Encodable {
         var tenant: TenantWithBilling
     }
@@ -553,10 +515,6 @@ struct Handler {
             }
             billingMap[history.player_id] = "visitor"
         }
-        
-        // player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
-        let unlock = try await flockByTenantID(tenantID: tenantID)
-        defer { unlock() }
         
         // スコアを登録した参加者のIDを取得する
         let scoredPlayerIDs = try await tenantDB.execute(
@@ -729,7 +687,7 @@ struct Handler {
             playerDetails.reserveCapacity(displayNames.count)
             
             for displayName in displayNames {
-                let id = try await dispenseID()
+                let id = dispenseID()
                 
                 let now = Int64(Date().timeIntervalSince1970)
                 try await tenantDB.sql().execute(
@@ -815,7 +773,7 @@ struct Handler {
             let title = form.title
             
             let now = Int64(Date().timeIntervalSince1970)
-            let id = try await dispenseID()
+            let id = dispenseID()
             try await tenantDB.sql().execute(
                 "INSERT INTO competition (id, tenant_id, title, finished_at, created_at, updated_at) VALUES (\(bind: id), \(bind: v.tenantID), \(bind: title), \(bind: Int64?.none), \(bind: now), \(bind: now))"
             ).run()
@@ -899,45 +857,54 @@ struct Handler {
                 throw Abort(.badRequest, reason: "invalid CSV headers")
             }
             
-            // DELETEしたタイミングで参照が来ると空っぽのランキングになるのでロックする
-            let unlock = try await flockByTenantID(tenantID: v.tenantID)
-            defer { unlock() }
-            var rowNum: Int64 = 0
-            var playerScoreRows: [PlayerScoreRow] = []
-            for row in reader {
-                rowNum += 1
+            let csvRows = try reader.compactMap { (row) -> (String, Int64) in
                 guard row.count == 2 else {
                     throw InternalError("row must have two columns: \(row)")
                 }
                 let playerID = row[0], score = Int64(row[1])
-                guard let _ = try await retrievePlayer(tenantDB: tenantDB.sql(), id: playerID) else {
-                    // 存在しない参加者が含まれている
-                    throw Abort(.badRequest, reason: "player not found: \(playerID)")
-                }
                 guard let score else {
                     throw Abort(.badRequest, reason: "error Int64: scoreStr=\(row[1])")
                 }
-                let id = try await dispenseID()
+                return (playerID, score)
+            }
+            let uniquePlayerIDs = Set(csvRows.map(\.0))
+            let count = try await tenantDB.sql().execute(
+                "SELECT COUNT(*) FROM player WHERE id IN (\(binds: uniquePlayerIDs.map { $0 }))"
+            ).first(collecting: { (c: Int64) in c })!
+            guard count == uniquePlayerIDs.count else {
+                throw Abort(.badRequest, reason: "player not found")
+            }
+            
+            let playerScoreRows: [PlayerScoreRow] = zip(Int64(1)..., csvRows).map { rowNum, row in
+                let id = dispenseID()
                 let now = Int64(Date().timeIntervalSince1970)
-                playerScoreRows.append(PlayerScoreRow(
+                return PlayerScoreRow(
                     tenant_id: v.tenantID,
                     id: id,
-                    player_id: playerID,
+                    player_id: row.0,
                     competition_id: competitionID,
-                    score: score,
+                    score: row.1,
                     row_num: rowNum,
                     created_at: now,
                     updated_at: now
-                ))
+                )
             }
-            
-            try await tenantDB.sql().execute(
-                "DELETE FROM player_score WHERE tenant_id = \(bind: v.tenantID) AND competition_id = \(bind: competitionID)"
-            ).run()
-            for ps in playerScoreRows {
+
+            try await tenantDB.transaction { tenantDB in
                 try await tenantDB.sql().execute(
-                    "INSERT INTO player_score (id, tenant_id, player_id, competition_id, score, row_num, created_at, updated_at) VALUES (\(bind:ps.id), \(bind:ps.tenant_id), \(bind:ps.player_id), \(bind:ps.competition_id), \(bind:ps.score), \(bind:ps.row_num), \(bind:ps.created_at), \(bind:ps.updated_at))"
+                    "DELETE FROM player_score WHERE tenant_id = \(bind: v.tenantID) AND competition_id = \(bind: competitionID)"
                 ).run()
+                
+                if !playerScoreRows.isEmpty {
+                    let inserts = playerScoreRows.map { ps -> SQLQueryString in
+                        "(\(bind:ps.id), \(bind:ps.tenant_id), \(bind:ps.player_id), \(bind:ps.competition_id), \(bind:ps.score), \(bind:ps.row_num), \(bind:ps.created_at), \(bind:ps.updated_at))"
+                    }
+                    try await tenantDB.sql().execute("""
+                        INSERT INTO player_score (id, tenant_id, player_id, competition_id, score, row_num, created_at, updated_at)
+                        VALUES \(inserts.joined(separator: ","));
+                    """
+                    ).run()
+                }
             }
             
             let res = ScoreResult(rows: playerScoreRows.count)
@@ -1006,10 +973,6 @@ struct Handler {
             let competitions = try await tenantDB.sql().execute(
                 "SELECT * FROM competition WHERE tenant_id = \(bind: v.tenantID) ORDER BY created_at ASC"
             ).all(decoding: CompetitionRow.self)
-            
-            // player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
-            let unlock = try await flockByTenantID(tenantID: v.tenantID)
-            defer { unlock() }
             
             var playerScores: [PlayerScoreRow] = []
             playerScores.reserveCapacity(competitions.count)
@@ -1102,12 +1065,24 @@ struct Handler {
             
             let rankAfter = (try? request.query.get(Int64.self, at: "rank_after")) ?? 0
             
-            // player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
-            let unlock = try await flockByTenantID(tenantID: v.tenantID)
-            defer { unlock () }
-            let playerScores = try await tenantDB.sql().execute(
-                "SELECT * FROM player_score WHERE tenant_id = \(bind: tenant.id) AND competition_id = \(bind: competitionID) ORDER BY row_num DESC"
-            ).all(decoding: PlayerScoreRow.self)
+            struct PlayerScoreRow: Decodable {
+                var tenant_id: Int64
+                var id: String
+                var player_id: String
+                var competition_id: String
+                var score: Int64
+                var row_num: Int64
+                var created_at: Int64
+                var updated_at: Int64
+                
+                var display_name: String
+            }
+            let playerScores = try await tenantDB.sql().execute("""
+                SELECT player_score.*, player.display_name FROM player_score
+                  JOIN player ON player.id = player_score.player_id
+                  WHERE player_score.tenant_id = \(bind: tenant.id) AND competition_id = \(bind: competitionID) ORDER BY row_num DESC;
+            """).all(decoding: PlayerScoreRow.self)
+            
             var ranks: [CompetitionRank] = []
             ranks.reserveCapacity(playerScores.count)
             var scoredPlayerSet: Set<String> = []
@@ -1119,14 +1094,12 @@ struct Handler {
                     continue
                 }
                 scoredPlayerSet.insert(ps.player_id)
-                guard let p = try await retrievePlayer(tenantDB: tenantDB.sql(), id: ps.player_id) else {
-                    throw InternalError("error retrievePlayer")
-                }
+
                 ranks.append(CompetitionRank(
                     rank: 0,
                     score: ps.score,
-                    player_id: p.id,
-                    player_display_name: p.display_name,
+                    player_id: ps.player_id,
+                    player_display_name: ps.display_name,
                     rowNum: ps.row_num
                 ))
             }
@@ -1346,6 +1319,18 @@ extension SQLQueryFetcher {
             return collecting(c0)
         }
     }
+    
+    func first<T, C0>(collecting: @escaping (C0) -> T) async throws -> T? where C0: Decodable {
+        let first = try await self.first()
+        return try first.map { row in
+            let allColumns = row.allColumns
+            guard allColumns.count >= 1 else {
+                throw InternalError("insufficient columns. count: \(allColumns.count)")
+            }
+            let c0 = try row.decode(column: allColumns[0], as: C0.self)
+            return collecting(c0)
+        }
+    }
 }
 
 extension Response {
@@ -1362,3 +1347,28 @@ struct UncheckedBox<T>: @unchecked Sendable {
 
 extension AbsolutePath: @unchecked Sendable {}
 extension RelativePath: @unchecked Sendable {}
+
+extension SQLiteConnection {
+    func transaction<T>(
+        _ closure: @escaping (SQLiteConnection) async throws -> T
+    ) async throws -> T {
+        let closure = UncheckedBox(value: closure)
+        return try await withConnection { conn in
+            let conn = UncheckedBox(value: conn)
+            return conn.value.query("BEGIN TRANSACTION").flatMapWithEventLoop { _, eventLoop in
+                eventLoop.performWithTask {
+                    try await closure.value(conn.value)
+                }.flatMap { result in
+                    let result = UncheckedBox(value: result)
+                    return conn.value.query("COMMIT TRANSACTION").map { _ in
+                        result.value
+                    }
+                }.flatMapError { error in
+                    conn.value.query("ROLLBACK TRANSACTION").flatMapThrowing { _ in
+                        throw error
+                    }
+                }
+            }
+        }.get()
+    }
+}
