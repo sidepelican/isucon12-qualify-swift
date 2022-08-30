@@ -203,6 +203,7 @@ struct Handler {
         return try await SQLiteConnection.open(
             storage: .file(path: tenantDBPath(id: id).pathString),
             threadPool: threadPool,
+            logger: request.logger,
             on: eventLoopGroup.next()
         )
         .flatMapWithEventLoop { (conn: SQLiteConnection, eventLoop: EventLoop) in
