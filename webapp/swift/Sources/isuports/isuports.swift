@@ -4,6 +4,7 @@ import SQLiteKit
 import JWTKit
 import TSCBasic
 import Vapor
+import gperftoolsSwift
 
 let tenantDBSchemaFilePath = "../sql/tenant/10_schema.sql"
 let initializeScript = "../sql/init.sh"
@@ -87,20 +88,52 @@ func errorResponseHandler(request: Request, error: any Error) -> Response {
     return try! .json(status: status, content: FailureResult(message: ""))
 }
 
+actor MemCache<Key: Hashable, Value> {
+    private var storage: [Key: Value] = [:]
+    
+    subscript(_ key: Key) -> Value? {
+        get {
+            storage[key]
+        }
+        _modify {
+            yield &storage[key]
+        }
+    }
+    func set(key: Key, value: Value) {
+        storage[key] = value
+    }
+    func remove(key: Key) {
+        storage.removeValue(forKey: key)
+    }
+}
+
+struct Pair<F: Hashable & Sendable, S: Hashable & Sendable>: Hashable, Sendable {
+    var first: F
+    var second: S
+    init(_ first: F, _ second: S) {
+        self.first = first
+        self.second = second
+    }
+}
+
 @main struct Main {
     static func main() async throws {
         LoggingSystem.bootstrap { label in
             var handler = ConsoleLogger(label: label, console: Terminal())
-            handler.logLevel = .debug
+            handler.logLevel = .error
             return handler
         }
         
         let (pool, shutdown) = connectAdminDB()
         defer { try! shutdown.close() }
         
-        let threadPool = NIOThreadPool(numberOfThreads: 16)
+        let threadPool = NIOThreadPool(numberOfThreads: 14)
         threadPool.start()
         defer { try! threadPool.syncShutdownGracefully() }
+        
+        let threadPool2 = NIOThreadPool(numberOfThreads: 2)
+        threadPool2.start()
+        defer { try! threadPool2.syncShutdownGracefully() }
         
         let app = try Application(.detect())
         defer { app.shutdown() }
@@ -122,11 +155,12 @@ func errorResponseHandler(request: Request, error: any Error) -> Response {
         func route(_ route: @escaping @Sendable (Handler.Type) -> (Handler) -> () async throws -> Response) -> (Request) async throws -> Response {
             { request in
                 var logger = request.logger
-                logger.logLevel = .error
+                logger.logLevel = .warning
                 let handler = Handler(
                     request: request,
                     adminDB: pool.database(logger: logger),
                     threadPool: threadPool,
+                    threadPool2: threadPool2,
                     eventLoopGroup: request.eventLoop,
                     signer: signer
                 )
@@ -161,6 +195,25 @@ func errorResponseHandler(request: Request, error: any Error) -> Response {
         // ベンチマーカー向けAPI
         app.post("initialize", use: route { $0.initialize })
         
+        let profilePath = NSTemporaryDirectory() + "a.profile"
+        app.get("profile") { (req) -> EventLoopFuture<Response> in
+            let waitSecond = min((try? req.query.get(TimeInterval.self, at: "s")) ?? 30, 120)
+            Profiler.start(fname: profilePath)
+
+            let promise = req.eventLoop.makePromise(of: Response.self)
+            let req = UncheckedBox(value: req)
+            DispatchQueue.global().asyncAfter(deadline: .now() + waitSecond) {
+                Profiler.stop()
+                let res = req.value.fileio.streamFile(at: profilePath)
+                promise.completeWith(.success(res))
+            }
+            return promise.futureResult
+        }
+
+        app.get("binary") { (req) -> Response in
+            return req.fileio.streamFile(at: ProcessInfo.processInfo.arguments[0])
+        }
+        
         try app.start()
         try await app.running?.onStop.get()
     }
@@ -189,6 +242,7 @@ struct Handler {
     var request: Request
     var adminDB: any MySQLDatabase
     var threadPool: NIOThreadPool
+    var threadPool2: NIOThreadPool
     var eventLoopGroup: any EventLoopGroup
     var signer: JWTSigner
     
@@ -200,11 +254,23 @@ struct Handler {
             .appending(component: "\(id).db")
     }
     
+    enum TenantDBPriority {
+        case high
+        case low
+    }
+    
     // テナントDBに接続する
-    func connectToTenantDB<T>(id: Int64, _ closure: @escaping (SQLiteConnection) async throws -> T) async throws -> T {
+    func connectToTenantDB<T>(id: Int64, priority: TenantDBPriority = .low, _ closure: @escaping (SQLiteConnection) async throws -> T) async throws -> T {
         let closure = UncheckedBox(value: closure)
         var logger = request.logger
-        logger.logLevel = .error
+        logger.logLevel = .warning
+        
+        let threadPool: NIOThreadPool
+        switch priority {
+        case .low: threadPool = self.threadPool
+        case .high: threadPool = self.threadPool2
+        }
+        
         return try await SQLiteConnection.open(
             storage: .file(path: tenantDBPath(id: id).pathString),
             threadPool: threadPool,
@@ -472,7 +538,7 @@ struct Handler {
         }
     }
     
-    struct BillingReport: Encodable {
+    struct BillingReport: Encodable, Sendable {
         var competition_id: String
         var competition_title: String
         var player_count: Int64        // スコアを登録した参加者数
@@ -495,20 +561,41 @@ struct Handler {
         var min_created_at: Int64
     }
     
+    static let billingReportByCompetitionCache = MemCache<Pair<Int64, String>, BillingReport>()
     // 大会ごとの課金レポートを計算する
     func billingReportByCompetition(tenantDB: some SQLDatabase, tenantID: Int64, competitonID: String) async throws -> BillingReport {
+        if let cache = await Self.billingReportByCompetitionCache[.init(tenantID, competitonID)] {
+            return cache
+        }
+        
         guard let comp = try await retrieveCompetition(tenantDB: tenantDB, id: competitonID) else {
             throw InternalError("error retrieveCompetition")
         }
         
+        if comp.finished_at == nil {
+            return BillingReport(
+                competition_id: comp.id,
+                competition_title: comp.title,
+                player_count: 0,
+                visitor_count: 0,
+                billing_player_yen: 0,
+                billing_visitor_yen: 0,
+                billing_yen: 0
+            )
+        }
+        
         // ランキングにアクセスした参加者のIDを取得する
-        let histories = try await adminDB.sql().execute(
+        async let histories = adminDB.sql().execute(
             "SELECT player_id, MIN(created_at) AS min_created_at FROM visit_history WHERE tenant_id = \(bind: tenantID) AND competition_id = \(bind: comp.id) GROUP BY player_id"
         ).all(decoding: VisitHistorySummaryRow.self)
         
+        // スコアを登録した参加者のIDを取得する
+        async let scoredPlayerIDs = tenantDB.execute(
+            "SELECT DISTINCT(player_id) FROM player_score WHERE tenant_id = \(bind: tenantID) AND competition_id = \(bind: comp.id)"
+        ).all(collecting: { (playerID: String) in playerID })
         
         var billingMap: [String: String] = [:]
-        for history in histories {
+        for history in try await histories {
             // competition.finished_atよりもあとの場合は、終了後に訪問したとみなして大会開催内アクセス済みとみなさない
             if let finished_at = comp.finished_at, finished_at < history.min_created_at {
                 continue
@@ -516,12 +603,7 @@ struct Handler {
             billingMap[history.player_id] = "visitor"
         }
         
-        // スコアを登録した参加者のIDを取得する
-        let scoredPlayerIDs = try await tenantDB.execute(
-            "SELECT DISTINCT(player_id) FROM player_score WHERE tenant_id = \(bind: tenantID) AND competition_id = \(bind: comp.id)"
-        ).all(collecting: { (playerID: String) in playerID })
-    
-        for pid in scoredPlayerIDs {
+        for pid in try await scoredPlayerIDs {
             // スコアが登録されている参加者
             billingMap[pid] = "player"
         }
@@ -539,7 +621,7 @@ struct Handler {
             }
         }
         
-        return BillingReport(
+        let ret = BillingReport(
             competition_id: comp.id,
             competition_title: comp.title,
             player_count: playerCount,
@@ -548,6 +630,9 @@ struct Handler {
             billing_visitor_yen: 10 * visitorCount, // ランキングを閲覧だけした(スコアを登録していない)参加者は10円
             billing_yen: 100 * playerCount + 10 * visitorCount
         )
+        
+        await Self.billingReportByCompetitionCache.set(key: .init(tenantID, competitonID), value: ret)
+        return ret
     }
     
     struct TenantWithBilling: Encodable {
@@ -830,10 +915,11 @@ struct Handler {
             throw Abort(.forbidden, reason: "role organizer required")
         }
         
-        return try await connectToTenantDB(id: v.tenantID) { tenantDB in
-            guard let competitionID = request.parameters.get("competition_id"), competitionID != "" else {
-                throw Abort(.badRequest, reason: "competition_id required")
-            }
+        guard let competitionID = request.parameters.get("competition_id"), competitionID != "" else {
+            throw Abort(.badRequest, reason: "competition_id required")
+        }
+
+        return try await connectToTenantDB(id: v.tenantID, priority: .high) { tenantDB in
             guard let comp = try await retrieveCompetition(tenantDB: tenantDB.sql(), id: competitionID) else {
                 // 存在しない大会
                 throw Abort(.notFound, reason: "competition not found")
@@ -1052,16 +1138,13 @@ struct Handler {
                 throw Abort(.notFound, reason: "competition not found")
             }
             
-            let now = Int64(Date().timeIntervalSince1970)
-            guard let tenant = try await adminDB.sql().execute(
-                "SELECT * FROM tenant WHERE id = \(bind: v.tenantID)"
-            ).first(decoding: TenantRow.self) else {
-                throw InternalError("tenant not found")
+            // 大会終了後のvisit_historyは使わないので記録をスキップ
+            if competition.finished_at == nil {
+                let now = Int64(Date().timeIntervalSince1970)
+                try await adminDB.sql().execute(
+                    "INSERT INTO visit_history (player_id, tenant_id, competition_id, created_at, updated_at) VALUES (\(bind: v.playerID), \(bind: v.tenantID), \(bind: competitionID), \(bind: now), \(bind: now))"
+                ).run()
             }
-            
-            try await adminDB.sql().execute(
-                "INSERT INTO visit_history (player_id, tenant_id, competition_id, created_at, updated_at) VALUES (\(bind: v.playerID), \(bind: tenant.id), \(bind: competitionID), \(bind: now), \(bind: now))"
-            ).run()
             
             let rankAfter = (try? request.query.get(Int64.self, at: "rank_after")) ?? 0
             
@@ -1080,7 +1163,7 @@ struct Handler {
             let playerScores = try await tenantDB.sql().execute("""
                 SELECT player_score.*, player.display_name FROM player_score
                   JOIN player ON player.id = player_score.player_id
-                  WHERE player_score.tenant_id = \(bind: tenant.id) AND competition_id = \(bind: competitionID) ORDER BY row_num DESC;
+                  WHERE player_score.tenant_id = \(bind: v.tenantID) AND competition_id = \(bind: competitionID) ORDER BY row_num DESC;
             """).all(decoding: PlayerScoreRow.self)
             
             var ranks: [CompetitionRank] = []

@@ -15,6 +15,7 @@ let package = Package(
         .package(url: "https://github.com/vapor/sqlite-kit.git", from: "4.1.0"),
         .package(url: "https://github.com/vapor/jwt-kit.git", from: "4.7.0"),
         .package(url: "https://github.com/yaslab/CSV.swift", from: "2.4.3"),
+        .package(url: "https://github.com/sidepelican/gperftoolsSwift.git", from: "0.1.0"),
     ],
     targets: [
         .executableTarget(
@@ -26,6 +27,7 @@ let package = Package(
                 .product(name: "SQLiteKit", package: "sqlite-kit"),
                 .product(name: "TSCBasic", package: "swift-tools-support-core"),
                 .product(name: "Vapor", package: "vapor"),
+                "gperftoolsSwift",
             ],
             swiftSettings: [
                 .unsafeFlags(["-strict-concurrency=complete"]),
