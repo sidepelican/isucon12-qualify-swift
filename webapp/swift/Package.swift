@@ -28,9 +28,6 @@ let package = Package(
                 .product(name: "TSCBasic", package: "swift-tools-support-core"),
                 .product(name: "Vapor", package: "vapor"),
                 "gperftoolsSwift",
-            ],
-            swiftSettings: [
-                .unsafeFlags(["-strict-concurrency=complete"]),
             ]
         ),
     ]
