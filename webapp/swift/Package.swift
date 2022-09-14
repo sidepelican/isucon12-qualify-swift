@@ -28,7 +28,7 @@ let package = Package(
                 .product(name: "Vapor", package: "vapor"),
             ],
             swiftSettings: [
-                .unsafeFlags(["-strict-concurrency=complete"]),
+                .unsafeFlags(["-strict-concurrency=complete", "-enable-bare-slash-regex"]),
             ]
         ),
     ]

@@ -1,4 +1,4 @@
-FROM swiftlang/swift:nightly-jammy
+FROM swift:5.7.0-jammy
 
 WORKDIR /tmp
 ENV DEBIAN_FRONTEND=noninteractive
@@ -8,7 +8,7 @@ RUN apt-get update && \
     wget -q https://dev.mysql.com/get/mysql-apt-config_0.8.22-1_all.deb && \
     apt-get -y install ./mysql-apt-config_*_all.deb && \
     apt-get -y update && \
-    apt-get -y install default-mysql-client
+    apt-get -y install mysql-client
 
 RUN useradd --uid=1001 --create-home isucon
 USER isucon
